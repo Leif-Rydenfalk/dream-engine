@@ -17,15 +17,21 @@ struct NeuronGPU {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct SimParams {
-    count: u32,
-    time: f32,
-    width: u32,
-    height: u32,
-    train_mode: u32,
-    _padding1: f32, // Padding to align to 16 bytes
-    _padding2: f32,
-    _padding3: f32,
+pub struct SimParams {
+    pub count: u32,
+    pub time: f32,
+    pub width: u32,
+    pub height: u32,
+
+    pub train_mode: u32,
+    pub sample_count: u32,
+    pub mix_rate: f32,
+    pub learning_rate: f32,
+
+    pub dream_decay: f32,
+    pub terror_threshold: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 pub struct BrainSystem {
@@ -48,7 +54,7 @@ pub struct BrainSystem {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    params: SimParams,
+    pub params: SimParams,
     start_time: std::time::Instant,
 }
 
@@ -142,9 +148,16 @@ impl BrainSystem {
             width: 512,
             height: 512,
             train_mode: 1,
-            _padding1: 0.0,
-            _padding2: 0.0,
-            _padding3: 0.0,
+
+            // TUNING DEFAULTS
+            sample_count: 8,       // 8 connections per frame
+            mix_rate: 0.01,        // 1% new reality, 99% internal state
+            learning_rate: 0.05,   // Moderate plasticity
+            dream_decay: 0.90,     // Short term memory decay
+            terror_threshold: 0.2, // Panic if error > 20%
+
+            _pad1: 0.0,
+            _pad2: 0.0,
         };
         let param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Brain Params"),

@@ -22,10 +22,16 @@ struct SimParams {
     time: f32,
     width: u32,
     height: u32,
-    train_mode: u32, // 1 = Training, 0 = Dreaming
-    _padding1: f32,
-    _padding2: f32,
-    _padding3: f32,
+    
+    train_mode: u32,
+    sample_count: u32,   // How many neighbors to check per frame
+    mix_rate: f32,       // How much new reality we let in (0.01 - 1.0)
+    learning_rate: f32,  // How fast we move concepts (0.0 - 0.1)
+    
+    dream_decay: f32,    // Short term memory retention (0.8 - 0.99)
+    terror_threshold: f32, // How much error before we panic (0.1 - 0.5)
+    _pad1: f32,
+    _pad2: f32,
 }
 
 // --- BINDINGS ---
@@ -77,36 +83,31 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var me = neurons[idx];
 
-    // ==========================================
-    // PHASE 1: THE DREAM (Monte Carlo Sampling)
-    // ==========================================
-    
+    // 1. DREAM (Sampling)
     var neighbor_activity_sum = 0.0;
     var connection_count = 0.0;
     
-    // Self-Memory (The "Ghosting")
-    neighbor_activity_sum += me.state.x * 0.9;
+    // Self-Memory (Configurable)
+    neighbor_activity_sum += me.state.x * params.dream_decay;
     connection_count += 1.0;
 
-    // We will sample 8 random locations around my concept
-    // effectively "casting a net" to catch nearby neurons
-    for (var i = 0u; i < 8u; i++) {
-        
-        // Generate a random offset based on ID and Iteration
-        let jitter = rand_vec3(idx + i * 1000u + u32(params.time * 100.0)) * CELL_SIZE;
+    // Dynamic Sample Count Loop
+    // We cap it at 32 just in case, to prevent infinite loops if data is bad
+    let loops = min(params.sample_count, 32u);
+
+    for (var i = 0u; i < loops; i++) {
+        // Jitter to probe neighborhood
+        let jitter = rand_vec3(idx + i * 1000u + u32(params.time * 60.0)) * CELL_SIZE;
         let probe_pos = me.pos_semantic.xyz + jitter;
-        
         let grid_idx = hash_coords(probe_pos);
+        
         let neighbor_id = atomicLoad(&spatial_grid[grid_idx]);
         
         if (neighbor_id != 0xFFFFFFFFu && neighbor_id != idx) {
             let other = neurons[neighbor_id];
-            
-            // Are they close enough in color/concept?
             let dist = distance(me.pos_semantic.xyz, other.pos_semantic.xyz);
             
             if (dist < CELL_SIZE) {
-                // Synaptic Weight: Closer = Stronger
                 let weight = 1.0 - (dist / CELL_SIZE);
                 neighbor_activity_sum += other.state.x * weight;
                 connection_count += weight;
@@ -114,93 +115,59 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Average the input
     if (connection_count > 0.0) {
-        neighbor_activity_sum /= connection_count; // Normalize
+        neighbor_activity_sum /= connection_count;
     }
     
-    // Amplify slightly (Gain Control) so the signal doesn't die
-    let predicted_activation = clamp(neighbor_activity_sum * 1.1, 0.0, 1.0);
+    let predicted_activation = clamp(neighbor_activity_sum * 1.05, 0.0, 1.0);
 
-    // ==========================================
-    // PHASE 2: VISUALIZATION (Write Output)
-    // ==========================================
-    // We write the PREDICTION to the texture. 
-    // If the network is wrong, you will see it be wrong here.
-    
+    // 2. VISUALIZATION
     if (predicted_activation > 0.01) {
         let dims = textureDimensions(output_texture);
-        let uv = me.pos_physical.xy * 0.5 + 0.5; // Map -1..1 to 0..1
+        let uv = me.pos_physical.xy * 0.5 + 0.5;
         let out_uv = vec2<i32>(vec2<f32>(dims) * uv);
-        
-        // The color is my Semantic Concept (what I believe I am)
-        // The brightness is my Predicted Activation (how sure I am)
+        // Color = Concept, Alpha/Bright = Prediction
         let pixel_color = abs(me.pos_semantic.xyz) * predicted_activation;
-        
         textureStore(output_texture, out_uv, vec4<f32>(pixel_color, 1.0));
     }
 
-    // ==========================================
-    // PHASE 3: REALITY CHECK (Training)
-    // ==========================================
-    
+    // 3. REALITY CHECK & LEARNING
     var error = 0.0;
     var input_activation = 0.0;
 
     if (params.train_mode == 1u) {
-        // Now we open our eyes.
         let uv = me.pos_physical.xy * 0.5 + 0.5;
         let real_pixel = textureSampleLevel(input_texture, input_sampler, uv, 0.0);
         
-        // How active should I have been?
-        // If my concept (Color) matches the real pixel, I should be active.
         let color_match = 1.0 - distance(real_pixel.rgb, abs(me.pos_semantic.xyz));
         input_activation = clamp(color_match, 0.0, 1.0);
-
-        // Error = Difference between Dream and Reality
         error = abs(predicted_activation - input_activation);
         
-        // ==========================================
-        // PHASE 4: LEARNING (Neuroplasticity)
-        // ==========================================
-        let learning_rate = 0.05;
-
-        if (error > 0.2) {
-            // TERROR: I was wrong.
-            // My Concept (Pos Semantic) doesn't match the reality at this Physical Location.
-            // MOVE my concept towards the real color.
-            
+        // Neuroplasticity
+        if (error > params.terror_threshold) {
+            // Terror
             let color_diff = real_pixel.rgb - abs(me.pos_semantic.xyz);
-            
-            // Physically move towards the correct color cluster
-            me.velocity.x += color_diff.r * learning_rate;
-            me.velocity.y += color_diff.g * learning_rate;
-            me.velocity.z += color_diff.b * learning_rate;
-            
-            // Jitter slightly to break out of bad clusters
-            me.velocity += (vec4<f32>(rand_vec3(idx), 0.0) * 0.01);
+            me.velocity.x += color_diff.r * params.learning_rate;
+            me.velocity.y += color_diff.g * params.learning_rate;
+            me.velocity.z += color_diff.b * params.learning_rate;
+            // Panic jitter
+            me.velocity += (vec4<f32>(rand_vec3(idx), 0.0) * params.learning_rate * 0.5);
         } else {
-            // DOPAMINE: I was right.
-            // Crystallize (stop moving).
+            // Dopamine
             me.velocity *= 0.5; 
         }
         
-        // Force state sync for next frame (Hebbian Imprinting)
-        // me.state.x = mix(predicted_activation, input_activation, 0.5);
-        me.state.x = mix(predicted_activation, input_activation, 0.001);
+        // Configurable Temporal Mixing
+        me.state.x = mix(predicted_activation, input_activation, params.mix_rate);
         
     } else {
-        // DREAM MODE: Closed Loop.
-        // State purely follows prediction.
+        // Dreaming
         me.state.x = predicted_activation;
         error = 0.0;
     }
 
-    // Physics Update
     me.pos_semantic += me.velocity * 0.1;
-    me.velocity *= 0.9; // Friction
-    
-    // Bound check (Concepts stay within 0-1 RGB space roughly)
+    me.velocity *= 0.9;
     me.pos_semantic = clamp(me.pos_semantic, vec4<f32>(-1.0), vec4<f32>(1.0));
 
     me.state.y = predicted_activation;

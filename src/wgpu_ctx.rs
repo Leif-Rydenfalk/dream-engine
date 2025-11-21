@@ -336,21 +336,65 @@ impl<'window> WgpuCtx<'window> {
             let ui = self.imgui.context.frame();
 
             // --- DASHBOARD WINDOW ---
+      
             ui.window("Neural Interlink")
                 .position([10.0, 10.0], Condition::FirstUseEver)
-                .size([600.0, 400.0], Condition::FirstUseEver)
+                .size([400.0, 600.0], Condition::FirstUseEver)
                 .build(|| {
                     ui.text(format!("FPS: {:.1}", ui.io().framerate));
                     ui.separator();
 
-                    let mode_text = if self.brain_system.get_train_mode() == 1 {
+                    // --- MODE CONTROL ---
+                    let mode_text = if self.brain_system.params.train_mode == 1 {
                         "Mode: TRAINING (Input On)"
                     } else {
                         "Mode: DREAMING (Input Off)"
                     };
                     ui.text(mode_text);
-                    ui.text("Hold SPACE to toggle Dream Mode");
+                    if ui.button("Toggle Dream Mode (Space)") {
+                        self.brain_system.params.train_mode = if self.brain_system.params.train_mode == 1 { 0 } else { 1 };
+                    }
                     ui.separator();
+
+                    // --- BRAIN TUNING ---
+                    ui.text("Synaptic Tuning");
+                    
+                    // Connectivity (Samples)
+                    // CAUTION: High values reduce FPS
+                    let mut samples = self.brain_system.params.sample_count as i32;
+                    if ui.slider("Connectivity", 1, 32, &mut samples) {
+                        self.brain_system.params.sample_count = samples as u32;
+                    }
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text("How many neighbors each neuron checks per frame.\nHigher = Smarter but Slower.");
+                    }
+
+                    // Mix Rate (Stubbornness)
+                    ui.slider("Reality Mix Rate", 0.001, 0.5, &mut self.brain_system.params.mix_rate);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text("Lower = Deep temporal integration (Ghosts).\nHigher = Instant reaction (Twitchy).");
+                    }
+
+                    // Dream Decay (Memory)
+                    ui.slider("Memory Decay", 0.5, 0.999, &mut self.brain_system.params.dream_decay);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text("How much energy is retained per frame.\n0.99 = Long Echoes.");
+                    }
+
+                    ui.separator();
+                    ui.text("Neuroplasticity");
+
+                    // Learning Rate
+                    ui.slider("Learning Rate", 0.0, 0.2, &mut self.brain_system.params.learning_rate);
+                    
+                    // Terror Threshold
+                    ui.slider("Panic Threshold", 0.01, 1.0, &mut self.brain_system.params.terror_threshold);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text("Error level required to trigger structural changes (movement).");
+                    }
+                    
+                    ui.separator();
+
 
                     if let (Some(in_id), Some(out_id)) =
                         (self.input_texture_id, self.output_texture_id)
