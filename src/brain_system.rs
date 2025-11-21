@@ -9,10 +9,21 @@ const GRID_SIZE: u32 = 64;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct NeuronGPU {
+    // The neuron's location on the "Retina" (0.0-1.0)
     pos_physical: [f32; 4],
-    pos_semantic: [f32; 4],
+
+    // 16-Dimensional Synaptic Weight Vector
+    // We visualize weights_a.xyz as 3D position
+    weights_a: [f32; 4],
+    weights_b: [f32; 4],
+    weights_c: [f32; 4],
+    weights_d: [f32; 4],
+
+    // x = firing_rate (voltage)
+    // y = prediction (previous firing rate)
+    // z = error (surprise)
+    // w = unused
     state: [f32; 4],
-    velocity: [f32; 4],
 }
 
 #[repr(C)]
@@ -75,18 +86,22 @@ impl BrainSystem {
         for i in 0..count {
             let u = (i % grid_dim_phys as u32) as f32 / grid_dim_phys as f32;
             let v = (i / grid_dim_phys as u32) as f32 / grid_dim_phys as f32;
+            // Remap 0..1 to -1..1 for clip space logic if needed,
+            // but we store 0..1 for UV sampling
             let px = u * 2.0 - 1.0;
             let py = v * 2.0 - 1.0;
 
-            let sx = (rand::random::<f32>() * 2.0 - 1.0) * 3.0; // Spread out start
-            let sy = (rand::random::<f32>() * 2.0 - 1.0) * 3.0;
-            let sz = (rand::random::<f32>() * 2.0 - 1.0) * 3.0;
+            // Initialize weights randomly (Gaussian-ish)
+            // These 16 floats determine what pattern makes this neuron fire
+            let w_gen = || (rand::random::<f32>() * 2.0 - 1.0);
 
             neurons.push(NeuronGPU {
                 pos_physical: [px, py, 0.0, 0.0],
-                pos_semantic: [sx, sy, sz, 1.0],
+                weights_a: [w_gen(), w_gen(), w_gen(), w_gen()],
+                weights_b: [w_gen(), w_gen(), w_gen(), w_gen()],
+                weights_c: [w_gen(), w_gen(), w_gen(), w_gen()],
+                weights_d: [w_gen(), w_gen(), w_gen(), w_gen()],
                 state: [0.0, 0.0, 0.0, 0.0],
-                velocity: [0.0, 0.0, 0.0, 0.0],
             });
         }
 
@@ -95,6 +110,58 @@ impl BrainSystem {
             contents: bytemuck::cast_slice(&neurons),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
         });
+
+        // ... (Rest of initialization is largely the same, omitting standard buffer setup for brevity) ...
+        // Ensure to copy the rest of the `new` function from the previous version exactly,
+        // as only the `neurons` vector initialization changed.
+
+        // <--- INSERT STANDARD BOILERPLATE FROM PREVIOUS FILE HERE --->
+
+        // When creating the Render Pipeline layout, we must match the new NeuronGPU struct layout
+        let instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<NeuronGPU>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                // pos_physical
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                // weights_a (Used for Position)
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                // weights_b (Used for Color/Info)
+                wgpu::VertexAttribute {
+                    offset: 32,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                // weights_c
+                wgpu::VertexAttribute {
+                    offset: 48,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                // weights_d
+                wgpu::VertexAttribute {
+                    offset: 64,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                // state
+                wgpu::VertexAttribute {
+                    offset: 80,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
+
+        // ... (Continue standard boilerplate) ...
 
         let grid_len = GRID_SIZE * GRID_SIZE * GRID_SIZE;
         let spatial_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -148,17 +215,15 @@ impl BrainSystem {
             width: 512,
             height: 512,
             train_mode: 1,
-
-            // TUNING DEFAULTS
-            sample_count: 8,       // 8 connections per frame
-            mix_rate: 0.01,        // 1% new reality, 99% internal state
-            learning_rate: 0.05,   // Moderate plasticity
-            dream_decay: 0.90,     // Short term memory decay
-            terror_threshold: 0.2, // Panic if error > 20%
-
+            sample_count: 8,
+            mix_rate: 0.05,
+            learning_rate: 0.05,
+            dream_decay: 0.95,
+            terror_threshold: 0.25,
             _pad1: 0.0,
             _pad2: 0.0,
         };
+
         let param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Brain Params"),
             contents: bytemuck::cast_slice(&[params]),
@@ -324,28 +389,6 @@ impl BrainSystem {
             push_constant_ranges: &[],
         });
 
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<NeuronGPU>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 3,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: 16,
-                    shader_location: 4,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: 32,
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
-        };
-
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Brain Render"),
             layout: Some(&render_layout),
@@ -402,13 +445,11 @@ impl BrainSystem {
         }
     }
 
-    pub fn get_train_mode(&self) -> u32 {
-        self.params.train_mode
-    }
+    // Methods update, render, etc, remain largely the same.
+    // Just ensuring update writes the new param struct correctly.
 
     pub fn update(&mut self, input: &crate::input::Input, _window_size: (u32, u32)) {
         self.params.time = self.start_time.elapsed().as_secs_f32();
-        // REMOVED MOUSE INPUT LOGIC HERE
         self.params.train_mode = if input.is_key_down(winit::keyboard::KeyCode::Space) {
             0
         } else {
@@ -441,6 +482,7 @@ impl BrainSystem {
             .write_buffer(&self.param_buffer, 0, bytemuck::cast_slice(&[self.params]));
     }
 
+    // Copy existing render functions below...
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -526,5 +568,9 @@ impl BrainSystem {
             self.output_texture.clone(),
             self.output_texture_view.clone(),
         )
+    }
+
+    pub fn get_train_mode(&self) -> u32 {
+        self.params.train_mode
     }
 }
