@@ -4,14 +4,16 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 const NEURON_COUNT: u32 = 1_000_000;
-const GRID_SIZE: u32 = 64; // 64^3 = 262,144 voxels
+// Must match shader GRID_DIM
+const GRID_SIZE: u32 = 64;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct NeuronGPU {
-    pos_physical: [f32; 4], // Fixed Tissue Position
-    pos_semantic: [f32; 4], // Dynamic Concept Position
-    state: [f32; 4],        // [Voltage, Recovery, Threshold, Trace]
+    pos_physical: [f32; 4],
+    pos_semantic: [f32; 4],
+    state: [f32; 4],
+    velocity: [f32; 4],
 }
 
 #[repr(C)]
@@ -33,7 +35,7 @@ pub struct BrainSystem {
 
     neuron_buffer: wgpu::Buffer,
     param_buffer: wgpu::Buffer,
-    concept_map_buffer: wgpu::Buffer,
+    spatial_grid_buffer: wgpu::Buffer, // The Spatial Hash Map
 
     pub camera: CameraFeed,
 
@@ -42,15 +44,14 @@ pub struct BrainSystem {
     pub output_texture: Arc<wgpu::Texture>,
     pub output_texture_view: Arc<wgpu::TextureView>,
 
-    // The main bind group for Compute (contains read_write storage)
     compute_bind_group: wgpu::BindGroup,
-
-    // An empty bind group for Rendering (to avoid read_write conflict)
     empty_bind_group: wgpu::BindGroup,
 
-    clear_pipeline: wgpu::ComputePipeline,
-    populate_pipeline: wgpu::ComputePipeline,
-    update_pipeline: wgpu::ComputePipeline,
+    // Pipelines
+    clear_grid_pipeline: wgpu::ComputePipeline,
+    populate_grid_pipeline: wgpu::ComputePipeline,
+    update_neurons_pipeline: wgpu::ComputePipeline,
+
     render_pipeline: wgpu::RenderPipeline,
 
     vertex_buffer: wgpu::Buffer,
@@ -74,23 +75,26 @@ impl BrainSystem {
 
         // 1. Initialize Neurons
         let mut neurons = Vec::with_capacity(count as usize);
-        let grid_dim = (count as f32).powf(1.0 / 3.0).ceil() as usize;
-        let spacing = 12.0 / grid_dim as f32;
+        let grid_dim_phys = (count as f32).powf(0.5).ceil() as usize; // 2D layout for physical
 
         for i in 0..count {
-            let x = (i % grid_dim as u32) as f32 * spacing - 6.0;
-            let y = ((i / grid_dim as u32) % grid_dim as u32) as f32 * spacing - 6.0;
-            let z = (i / (grid_dim as u32 * grid_dim as u32)) as f32 * spacing - 6.0;
+            // Physical Position: Grid layout mapping to UV -1.0 to 1.0
+            let u = (i % grid_dim_phys as u32) as f32 / grid_dim_phys as f32;
+            let v = (i / grid_dim_phys as u32) as f32 / grid_dim_phys as f32;
 
-            let sx = rand::random::<f32>() * 2.0 - 1.0;
-            let sy = rand::random::<f32>() * 2.0 - 1.0;
-            let sz = rand::random::<f32>() * 2.0 - 1.0;
-            let len = (sx * sx + sy * sy + sz * sz).sqrt();
+            let px = u * 2.0 - 1.0;
+            let py = v * 2.0 - 1.0;
+
+            // Semantic Position: Random Cloud
+            let sx = (rand::random::<f32>() * 2.0 - 1.0) * 2.0;
+            let sy = (rand::random::<f32>() * 2.0 - 1.0) * 2.0;
+            let sz = (rand::random::<f32>() * 2.0 - 1.0) * 2.0;
 
             neurons.push(NeuronGPU {
-                pos_physical: [x, y, z, 1.0],
-                pos_semantic: [sx / len, sy / len, sz / len, 1.0],
-                state: [0.0, 0.0, 0.5, 0.0],
+                pos_physical: [px, py, 0.0, 0.0],
+                pos_semantic: [sx, sy, sz, 1.0],
+                state: [0.0, 0.0, 0.0, 0.0],
+                velocity: [0.0, 0.0, 0.0, 0.0],
             });
         }
 
@@ -100,11 +104,12 @@ impl BrainSystem {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
         });
 
-        // 2. Concept Map Buffer
-        let concept_map_size = (GRID_SIZE * GRID_SIZE * GRID_SIZE) as u64 * 4;
-        let concept_map_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Concept Map Buffer"),
-            size: concept_map_size,
+        // 2. Spatial Grid Buffer (Atomic U32)
+        // Size = GRID_SIZE^3 * sizeof(u32)
+        let grid_len = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        let spatial_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Spatial Grid Buffer"),
+            size: (grid_len as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -115,6 +120,7 @@ impl BrainSystem {
             height: 512,
             depth_or_array_layers: 1,
         };
+
         let input_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Eye Input"),
             size: tex_size,
@@ -134,7 +140,9 @@ impl BrainSystem {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         }));
         let output_view = Arc::new(output_texture.create_view(&Default::default()));
@@ -162,14 +170,15 @@ impl BrainSystem {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // 5a. Compute Bind Group Layout
+        // 5. Bind Groups
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Brain Compute Layout"),
                 entries: &[
+                    // 0: Neurons
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE, // Only visible to compute
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
@@ -177,6 +186,7 @@ impl BrainSystem {
                         },
                         count: None,
                     },
+                    // 1: Params
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -187,6 +197,7 @@ impl BrainSystem {
                         },
                         count: None,
                     },
+                    // 2: Input Tex
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -197,12 +208,14 @@ impl BrainSystem {
                         },
                         count: None,
                     },
+                    // 3: Sampler
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // 4: Output Tex
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -213,6 +226,7 @@ impl BrainSystem {
                         },
                         count: None,
                     },
+                    // 5: Spatial Grid
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -252,27 +266,23 @@ impl BrainSystem {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: concept_map_buffer.as_entire_binding(),
+                    resource: spatial_grid_buffer.as_entire_binding(),
                 },
             ],
         });
 
-        // 5b. Render Bind Group Layout (Empty Group 0)
-        // The vertex shader does not use Group 0, only Group 1 (Camera).
-        // However, wgpu expects a bind group for index 0 if the pipeline layout has one.
         let empty_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Empty Layout"),
                 entries: &[],
             });
-
         let empty_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Empty BG"),
             layout: &empty_bind_group_layout,
             entries: &[],
         });
 
-        // 6. Compute Pipelines
+        // 6. Pipelines
         let shader = shader_hot_reload.get_shader("brain.wgsl");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Compute Pipeline Layout"),
@@ -280,34 +290,37 @@ impl BrainSystem {
             push_constant_ranges: &[],
         });
 
-        let clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Clear Grid"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("cs_clear_grid"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let clear_grid_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Clear Grid"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("cs_clear_grid"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
-        let populate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Populate Grid"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("cs_populate_grid"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let populate_grid_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Populate Grid"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("cs_populate_grid"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
-        let update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Update Neurons"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("cs_update_neurons"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let update_neurons_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Update Neurons"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("cs_update_neurons"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
-        // 7. Render Pipeline
+        // Render Pipeline
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(vertex::VERTICES_CUBE),
@@ -319,7 +332,6 @@ impl BrainSystem {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        // CHANGED: Render Pipeline uses the EMPTY layout for Group 0
         let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&empty_bind_group_layout, camera_bind_group_layout],
@@ -334,17 +346,17 @@ impl BrainSystem {
                     offset: 0,
                     shader_location: 3,
                     format: wgpu::VertexFormat::Float32x4,
-                },
+                }, // Pos Phys
                 wgpu::VertexAttribute {
                     offset: 16,
                     shader_location: 4,
                     format: wgpu::VertexFormat::Float32x4,
-                },
+                }, // Pos Sem
                 wgpu::VertexAttribute {
                     offset: 32,
                     shader_location: 5,
                     format: wgpu::VertexFormat::Float32x4,
-                },
+                }, // State
             ],
         };
 
@@ -384,7 +396,7 @@ impl BrainSystem {
             queue,
             neuron_buffer,
             param_buffer,
-            concept_map_buffer,
+            spatial_grid_buffer,
             input_texture,
             input_texture_view: input_view,
             output_texture,
@@ -392,9 +404,9 @@ impl BrainSystem {
             compute_bind_group,
             empty_bind_group,
             camera: CameraFeed::new(camera_url),
-            clear_pipeline,
-            populate_pipeline,
-            update_pipeline,
+            clear_grid_pipeline,
+            populate_grid_pipeline,
+            update_neurons_pipeline,
             render_pipeline,
             vertex_buffer,
             index_buffer,
@@ -457,42 +469,38 @@ impl BrainSystem {
         depth: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
-        // 1. Clear
+        // 1. Clear Grid
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Clear"),
+                label: Some("Clear Grid"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.clear_pipeline);
-            // Use Compute BG
+            cpass.set_pipeline(&self.clear_grid_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let num_voxels = GRID_SIZE * GRID_SIZE * GRID_SIZE;
-            let groups = (num_voxels + 63) / 64;
-            cpass.dispatch_workgroups(groups, 1, 1);
+            let grid_num = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+            cpass.dispatch_workgroups((grid_num + 63) / 64, 1, 1);
         }
-        // 2. Populate
+        // 2. Populate Grid (Atomic Scatter)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Populate"),
+                label: Some("Populate Grid"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.populate_pipeline);
+            cpass.set_pipeline(&self.populate_grid_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let groups = (self.params.count + 63) / 64;
-            cpass.dispatch_workgroups(groups, 1, 1);
+            cpass.dispatch_workgroups((self.params.count + 63) / 64, 1, 1);
         }
-        // 3. Update
+        // 3. Update Neurons (Sense -> Dream -> Learn)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Update"),
+                label: Some("Update Neurons"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.update_pipeline);
+            cpass.set_pipeline(&self.update_neurons_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let groups = (self.params.count + 63) / 64;
-            cpass.dispatch_workgroups(groups, 1, 1);
+            cpass.dispatch_workgroups((self.params.count + 63) / 64, 1, 1);
         }
-        // 4. Render
+        // 4. Render 3D View
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Brain Draw"),
@@ -516,11 +524,9 @@ impl BrainSystem {
                 occlusion_query_set: None,
             });
             rpass.set_pipeline(&self.render_pipeline);
-            // CHANGED: Use Empty BG for Group 0 to avoid conflict with vertex buffer usage
             rpass.set_bind_group(0, &self.empty_bind_group, &[]);
             rpass.set_bind_group(1, camera_bg, &[]);
             rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            // Now safe to bind neuron_buffer as vertex input
             rpass.set_vertex_buffer(1, self.neuron_buffer.slice(..));
             rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..self.num_indices, 0, 0..self.params.count);

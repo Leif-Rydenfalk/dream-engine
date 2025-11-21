@@ -1,18 +1,24 @@
-// src/shaders/brain.wgsl
-
-// --- Structs ---
+// --- DATA STRUCTURES ---
 
 struct Neuron {
-    pos_physical: vec4<f32>, // xyz: Location in brain, w: unused
-    pos_semantic: vec4<f32>, // xyz: Location in concept space, w: unused
+    // Coordinate Set 1: Fixed Physical (Where it is on screen/tissue)
+    // xy = uv coordinates (0.0-1.0), z = depth layer, w = unused
+    pos_physical: vec4<f32>,
+
+    // Coordinate Set 2: Dynamic Semantic (The "Weight" / "Concept")
+    // xyz = concept space position, w = "mass" or clustering radius
+    pos_semantic: vec4<f32>,
+
+    // State
+    // x = voltage (current activity)
+    // y = prediction_val (what I think the pixel should be)
+    // z = error_trace (accumulated surprise)
+    // w = unused
+    state: vec4<f32>,
     
-    // State Vector:
-    // x: Voltage (0.0 to 1.0)
-    // y: Recovery/Fatigue (0.0 to 1.0)
-    // z: Threshold (Homeostatic)
-    // w: Trace (Recent firing memory for Hebbian learning)
-    state: vec4<f32>, 
-};
+    // Momentum for semantic movement
+    velocity: vec4<f32>,
+}
 
 struct SimParams {
     count: u32,
@@ -22,200 +28,209 @@ struct SimParams {
     mouse_x: f32,
     mouse_y: f32,
     is_clicking: u32,
-    train_mode: u32, // 1 = Learning/Input, 0 = Dreaming
-};
+    train_mode: u32, // 1 = Training (Input On), 0 = Dreaming (Input Off)
+}
 
-struct CameraUniform {
-    view_proj: mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    view: mat4x4<f32>,
-    pos: vec3<f32>,
-};
-
-// --- Bindings ---
+// --- BINDINGS ---
 
 @group(0) @binding(0) var<storage, read_write> neurons: array<Neuron>;
 @group(0) @binding(1) var<uniform> params: SimParams;
-@group(0) @binding(2) var input_texture: texture_2d<f32>;
+@group(0) @binding(2) var input_texture: texture_2d<f32>;       // Camera Feed
 @group(0) @binding(3) var input_sampler: sampler;
 @group(0) @binding(4) var output_texture: texture_storage_2d<rgba32float, write>;
+// The Spatial Hash Grid (Index -> Neuron ID)
+// We use atomic exchange to populate it. Last neuron to write wins.
+// This provides stochastic sampling of neighbors, which prevents N^2.
+@group(0) @binding(5) var<storage, read_write> spatial_grid: array<atomic<u32>>; 
 
-// The "Field" - A Linearized 3D Density Map of semantic activity
-// Replaces texture_storage_3d to allow generic atomics
-@group(0) @binding(5) var<storage, read_write> concept_map: array<atomic<u32>>;
+const GRID_DIM: u32 = 64u; // Must match Rust GRID_SIZE
+const CELL_SIZE: f32 = 0.15; // Size of a "concept bucket"
 
-@group(1) @binding(0) var<uniform> camera: CameraUniform;
+// --- UTILS ---
 
-// --- Constants ---
-
-const GRID_SIZE: u32 = 64u; // Must match Rust const
-const GRID_SIZE_SQ: u32 = 4096u; // 64 * 64
-const DT: f32 = 0.016;
-const DECAY: f32 = 0.90;
-const RECOVERY_RATE: f32 = 0.05;
-const LEARNING_RATE: f32 = 0.01;
-const NOISE: f32 = 0.001;
-
-// --- Helpers ---
-
-fn get_grid_index(p: vec3<i32>) -> u32 {
-    return u32(p.x) + u32(p.y) * GRID_SIZE + u32(p.z) * GRID_SIZE_SQ;
+fn hash_coords(pos: vec3<f32>) -> u32 {
+    // Convert float position to grid index
+    // Position range is roughly -3.0 to 3.0
+    let grid_pos = vec3<u32>(clamp((pos + 3.0) / CELL_SIZE, vec3<f32>(0.0), vec3<f32>(f32(GRID_DIM) - 1.0)));
+    return grid_pos.x + (grid_pos.y * GRID_DIM) + (grid_pos.z * GRID_DIM * GRID_DIM);
 }
 
-// Hash function for pseudo-randomness
-fn hash(n: u32) -> f32 {
-    var x = n;
-    x = (x << 13u) ^ x;
-    return (1.0 - f32((x * (x * x * 15731u + 789221u) + 1376312589u) & 0x7fffffffu) / 1073741824.0);
+fn rand_vec3(seed: u32) -> vec3<f32> {
+    let t = f32(seed) + params.time;
+    return vec3<f32>(
+        fract(sin(t * 12.9898) * 43758.5453),
+        fract(sin(t * 78.233) * 43758.5453),
+        fract(sin(t * 151.7182) * 43758.5453)
+    ) * 2.0 - 1.0;
 }
 
-fn float_to_uint(val: f32) -> u32 {
-    return u32(max(0.0, val) * 1000.0);
-}
-
-fn uint_to_float(val: u32) -> f32 {
-    return f32(val) / 1000.0;
-}
-
-// --- Compute Pass 1: Clear the Concept Field ---
+// --- PASS 1: CLEAR GRID ---
 @compute @workgroup_size(64)
 fn cs_clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
-    // Total voxels = 64*64*64 = 262,144
-    if (idx >= (GRID_SIZE * GRID_SIZE * GRID_SIZE)) { return; }
-    atomicStore(&concept_map[idx], 0u);
+    if (idx >= arrayLength(&spatial_grid)) { return; }
+    atomicStore(&spatial_grid[idx], 0xFFFFFFFFu); // Sentinel value
 }
 
-// --- Compute Pass 2: Emit Signals & Handle Input ---
+// --- PASS 2: POPULATE GRID (Semantic Layout) ---
 @compute @workgroup_size(64)
 fn cs_populate_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= params.count) { return; }
     
-    var n = neurons[idx];
+    let me = neurons[idx];
+    let grid_idx = hash_coords(me.pos_semantic.xyz);
     
-    // 1. Sensory Input (Optic Nerve)
-    if (params.train_mode == 1u && idx < (params.width * params.height)) {
-        let uv = vec2<f32>(
-            f32(idx % params.width) / f32(params.width),
-            f32(idx / params.width) / f32(params.height)
-        );
-        let color = textureSampleLevel(input_texture, input_sampler, uv, 0.0);
-        // Stimulation
-        n.state.x += length(color.rgb) * 0.5; 
-    }
-
-    // 2. Emit to Field (Atomic Add to Buffer)
-    if (n.state.x > 0.1) {
-        let grid_pos = vec3<i32>((n.pos_semantic.xyz + 1.0) * 0.5 * f32(GRID_SIZE));
-        
-        if (grid_pos.x >= 0 && grid_pos.x < i32(GRID_SIZE) &&
-            grid_pos.y >= 0 && grid_pos.y < i32(GRID_SIZE) &&
-            grid_pos.z >= 0 && grid_pos.z < i32(GRID_SIZE)) {
-            
-            let density = float_to_uint(n.state.x);
-            let buffer_idx = get_grid_index(grid_pos);
-            atomicAdd(&concept_map[buffer_idx], density);
-        }
-    }
-
-    neurons[idx] = n;
+    // Write my ID into the grid. 
+    // Race condition is intentional: we only need *some* neighbor in this cell.
+    atomicStore(&spatial_grid[grid_idx], idx);
 }
 
-// --- Compute Pass 3: Update Logic & Plasticity ---
+// --- PASS 3: UPDATE NEURONS (Sense, Dream, Learn) ---
 @compute @workgroup_size(64)
 fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= params.count) { return; }
+
+    var me = neurons[idx];
+
+    // 1. SENSORY INPUT (Reality)
+    // --------------------------
+    // Map physical position (screen space) to UV
+    // pos_physical xy is in range [-aspect, aspect] roughly. Let's map -1..1 to 0..1
+    let uv = me.pos_physical.xy * 0.5 + 0.5;
+    let real_color = textureSampleLevel(input_texture, input_sampler, uv, 0.0);
     
-    var n = neurons[idx];
-    var voltage = n.state.x;
-    var recovery = n.state.y;
-    var threshold = n.state.z;
-    var trace = n.state.w;
+    // Calculate brightness/activation from reality
+    let input_activation = length(real_color.rgb);
 
-    // --- 1. Synaptic Integration (Reading the Buffer) ---
-    let grid_pos = vec3<i32>((n.pos_semantic.xyz + 1.0) * 0.5 * f32(GRID_SIZE));
-    var input_current = 0.0;
+    // 2. DREAM / PREDICTION (Inference)
+    // ---------------------------------
+    // Look at Semantic Neighbors to determine my next state.
+    // "If my concept-neighbors are active, I should be active."
+    
+    var neighbor_activity_sum = 0.0;
+    var cohesion_force = vec3<f32>(0.0);
+    var neighbor_count = 0.0;
 
-    // Sample 3x3x3 volume
-    for (var z = -1; z <= 1; z++) {
-        for (var y = -1; y <= 1; y++) {
-            for (var x = -1; x <= 1; x++) {
-                let sample_pos = grid_pos + vec3<i32>(x, y, z);
-                if (sample_pos.x >= 0 && sample_pos.x < i32(GRID_SIZE) &&
-                    sample_pos.y >= 0 && sample_pos.y < i32(GRID_SIZE) &&
-                    sample_pos.z >= 0 && sample_pos.z < i32(GRID_SIZE)) {
-                    
-                    let buffer_idx = get_grid_index(sample_pos);
-                    let field_val = atomicLoad(&concept_map[buffer_idx]);
-                    let density = uint_to_float(field_val);
-                    
-                    let dist = length(vec3<f32>(f32(x), f32(y), f32(z)));
-                    input_current += density * (1.0 / (1.0 + dist * dist));
-                }
+    let my_grid_idx = hash_coords(me.pos_semantic.xyz);
+
+    // Check immediate neighborhood (3x3x3 grid)
+    // Note: In a full implementation, we'd loop -1 to 1. 
+    // For performance, we check 3 random offsets or just the center.
+    // Let's check center + random offset.
+    
+    // Look at my own cell
+    let neighbor_id = atomicLoad(&spatial_grid[my_grid_idx]);
+    
+    if (neighbor_id != 0xFFFFFFFFu && neighbor_id != idx) {
+        let other = neurons[neighbor_id];
+        
+        // Semantic Distance
+        let dist = distance(me.pos_semantic.xyz, other.pos_semantic.xyz);
+        
+        if (dist < 0.5) {
+            // Standard Neural Summation
+            neighbor_activity_sum += other.state.x; 
+            
+            // Swarming: Pull towards active neighbors
+            if (other.state.x > 0.5) {
+               cohesion_force += (other.pos_semantic.xyz - me.pos_semantic.xyz);
             }
+            neighbor_count += 1.0;
         }
     }
 
-    input_current *= 0.05; 
-
-    // --- 2. Dynamics ---
-    voltage *= DECAY;
-    voltage += input_current;
+    // My "Predicted" state is based on neighbors (Associative Memory)
+    // If I have no neighbors, I predict 0.
+    let predicted_activation = clamp(neighbor_activity_sum * 0.1, 0.0, 1.0);
     
-    if (recovery > 0.1) {
-        voltage *= 0.5;
-        recovery -= RECOVERY_RATE;
-    }
-
-    if (params.train_mode == 0u) {
-         voltage += (hash(idx + u32(params.time * 1000.0)) - 0.5) * 0.05;
-    }
-
-    var fired = false;
-    if (voltage > threshold) {
-        fired = true;
-        voltage = -0.1;
-        recovery = 1.0;
-        trace = 1.0;
-        threshold += 0.002;
-    } else {
-        threshold = max(0.1, threshold - 0.00001);
-        trace *= 0.95;
-    }
-
-    // --- 3. Plasticity ---
+    // 3. LEARNING (The Error Signal)
+    // ------------------------------
+    
+    var error = 0.0;
+    
     if (params.train_mode == 1u) {
-        if (trace > 0.5) {
-             let rnd = vec3<f32>(
-                hash(idx * 3u) - 0.5, 
-                hash(idx * 3u + 1u) - 0.5, 
-                hash(idx * 3u + 2u) - 0.5
-             );
-             n.pos_semantic = vec4<f32>(normalize(n.pos_semantic.xyz + rnd * LEARNING_RATE), 1.0);
+        // Training Mode: Compare Prediction to Reality
+        // Error = |My Prediction - What actually happened|
+        error = abs(predicted_activation - input_activation);
+        
+        // Force my state to match reality (clamp to input) so the signal propagates
+        me.state.x = mix(me.state.x, input_activation, 0.2);
+    } else {
+        // Dreaming Mode: My state is purely my prediction
+        // The signal ripples through the semantic web without external correction
+        me.state.x = mix(me.state.x, predicted_activation, 0.1);
+        error = 0.0; // No stress in dreams
+    }
+
+    // 4. NEUROPLASTICITY (Movement)
+    // -----------------------------
+    
+    let learning_rate = 0.02;
+    
+    if (error < 0.2 && params.train_mode == 1u && input_activation > 0.1) {
+        // --- DOPAMINE (Low Error + High Activity) ---
+        // "I correctly predicted this! I belong here."
+        // Strengthen: Move closer to the neighbors that helped me predict.
+        
+        if (neighbor_count > 0.0) {
+            me.velocity += vec4<f32>(cohesion_force * learning_rate * 2.0, 0.0);
         }
+        
+        // Reward: Decay velocity (crystallize)
+        me.velocity *= 0.90;
+        
+    } else if (error > 0.4 && params.train_mode == 1u) {
+        // --- TERROR (High Error) ---
+        // "I was wrong! This concept position is invalid."
+        // Panic: Jitter randomly to find a new semantic meaning.
+        
+        let panic_dir = rand_vec3(idx);
+        me.velocity += vec4<f32>(panic_dir * learning_rate * 5.0, 0.0);
     }
+    
+    // 5. PHYSICS UPDATE
+    // -----------------
+    // Apply velocity
+    me.pos_semantic += me.velocity * 0.1;
+    // Drag/Friction
+    me.velocity *= 0.95;
+    // Centripetal force (keep them from flying off into infinity)
+    me.velocity -= me.pos_semantic * 0.001;
 
-    // --- 4. Output ---
-    if (idx < (params.width * params.height)) {
-        let out_uv = vec2<i32>(
-            i32(idx) % i32(params.width),
-            i32(idx) / i32(params.width)
-        );
-        let color = vec4<f32>(n.pos_semantic.xyz * 0.5 + 0.5, 1.0) * (voltage + trace);
-        textureStore(output_texture, out_uv, color);
+    // 6. OUTPUT VISUALIZATION
+    // -----------------------
+    // Write to the output texture ("Visual Cortex")
+    // We visualize the Neuron's PREDICTION, colored by its SEMANTIC POSITION.
+    // This lets us see "Concepts" forming as colors.
+    
+    if (me.state.x > 0.1) {
+        let dims = textureDimensions(output_texture);
+        let out_uv = vec2<i32>(vec2<f32>(dims) * uv);
+        
+        // Color = Semantic Position (normalized) -> RGB
+        // Brightness = Activation
+        let concept_color = normalize(abs(me.pos_semantic.xyz)) * me.state.x;
+        
+        // We accumulate into the texture (since many neurons map to one pixel)
+        // Note: Atomic float add isn't available, so we just overwrite or simple mix
+        // For this demo, we just write.
+        textureStore(output_texture, out_uv, vec4<f32>(concept_color, 1.0));
     }
-
-    n.state = vec4<f32>(voltage, recovery, threshold, trace);
-    neurons[idx] = n;
+    
+    // Save state
+    me.state.y = predicted_activation;
+    me.state.z = error; // Trace
+    neurons[idx] = me;
 }
 
-// --- Rendering (Vertex & Fragment) ---
+// --- RENDER SHADER (Vertex + Fragment) ---
+// Visualizes the neurons as a 3D point cloud in the "Brain View"
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) uv: vec2<f32>,
+    @location(1) tex_uv: vec2<f32>,
     @location(2) normal: vec3<f32>,
 };
 
@@ -230,22 +245,40 @@ struct VertexOutput {
     @location(0) color: vec3<f32>,
 };
 
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    view: mat4x4<f32>,
+    pos: vec3<f32>,
+    _padding: u32,
+    time: f32,
+};
+@group(1) @binding(0) var<uniform> camera: CameraUniform;
+
 @vertex
-fn vs_main(
-    model: VertexInput,
-    instance: InstanceInput,
-) -> VertexOutput {
+fn vs_main(model: VertexInput, instance: InstanceInput) -> VertexOutput {
     var out: VertexOutput;
-    let scale = 0.02 + (instance.state.x * 0.05); 
-    let world_pos = instance.pos_physical.xyz + (model.position * scale);
+    
+    // Visualize Semantic Position (The "Mind Map")
+    let world_pos = instance.pos_semantic.xyz + (model.position * 0.05);
     
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     
-    let semantic_color = instance.pos_semantic.xyz * 0.5 + 0.5;
-    let active_color = vec3<f32>(1.0, 0.2, 0.1);
+    // Color based on state:
+    // White = Active
+    // Red = High Error (Terror)
+    // Blue = Low Error (Stable)
+    let activity = instance.state.x;
+    let error = instance.state.z;
     
-    out.color = mix(semantic_color * 0.2, active_color, instance.state.x);
+    let base_color = normalize(abs(instance.pos_semantic.xyz));
+    var final_color = mix(base_color * 0.2, vec3<f32>(1.0, 1.0, 1.0), activity);
     
+    if (error > 0.3) {
+        final_color = mix(final_color, vec3<f32>(1.0, 0.0, 0.0), 0.8); // Red flash on error
+    }
+    
+    out.color = final_color;
     return out;
 }
 
