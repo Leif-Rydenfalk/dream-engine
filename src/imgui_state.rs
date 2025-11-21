@@ -1,8 +1,7 @@
-
 use std::time::Instant;
 
 use imgui::*;
-use imgui_wgpu::{Renderer, RendererConfig};
+use imgui_wgpu::Renderer;
 use imgui_winit_support::WinitPlatform;
 
 // --- ImguiState Struct (Unchanged) ---

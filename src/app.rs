@@ -6,7 +6,6 @@ use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::MouseScrollDelta::*;
 use winit::event::WindowEvent;
-use winit::event::{DeviceEvent, DeviceId};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::PhysicalKey;
 use winit::keyboard::{Key, NamedKey};

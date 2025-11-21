@@ -1,5 +1,4 @@
 // src/camera.rs
-use image::DynamicImage;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;

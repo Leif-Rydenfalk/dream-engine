@@ -1,7 +1,6 @@
 // src/main.rs
 #![feature(portable_simd)]
 
-use crate::app::App;
 use winit::error::EventLoopError;
 use winit::event_loop::{ControlFlow, EventLoop};
 

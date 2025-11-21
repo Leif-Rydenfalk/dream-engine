@@ -1,7 +1,7 @@
 // input_system.rs
 use std::collections::HashMap;
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use winit::event::{ElementState, MouseButton};
 use winit::keyboard::KeyCode;
 
 #[derive(Default)]

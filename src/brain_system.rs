@@ -34,18 +34,17 @@ pub struct BrainSystem {
 
     // Camera / Input
     camera: CameraFeed,
-    input_texture: wgpu::Texture,
-    input_texture_view: wgpu::TextureView,
+    pub input_texture: Arc<wgpu::Texture>, // Changed to Arc
+    pub input_texture_view: Arc<wgpu::TextureView>, // Changed to Arc
 
     // Hallucination / Output
-    output_texture: wgpu::Texture,
-    output_texture_view: wgpu::TextureView,
+    pub output_texture: Arc<wgpu::Texture>, // Changed to Arc
+    pub output_texture_view: Arc<wgpu::TextureView>, // Changed to Arc
 
     bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
-    render_pipeline: wgpu::RenderPipeline, // Standard cube rendering
+    render_pipeline: wgpu::RenderPipeline,
 
-    // Rendering Geometry
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -70,15 +69,6 @@ impl BrainSystem {
         let spacing = 0.05;
 
         for i in 0..count {
-            // Brain Shape (Sphere)
-            // let mut pos = [
-            //     (rand::random::<f32>() - 0.5) * 4.0,
-            //     (rand::random::<f32>() - 0.5) * 4.0,
-            //     (rand::random::<f32>() - 0.5) * 4.0,
-            //     1.0
-            // ];
-
-            // Grid shape for better visualization
             let x = (i % grid) as f32 * spacing - (grid as f32 * spacing / 2.0);
             let y = ((i / grid) % grid) as f32 * spacing - (grid as f32 * spacing / 2.0);
             let z = (i / (grid * grid)) as f32 * spacing - (grid as f32 * spacing / 2.0);
@@ -86,7 +76,7 @@ impl BrainSystem {
             neurons.push(NeuronGPU {
                 pos: [x, y, z, 1.0],
                 weight: [rand::random(), rand::random(), rand::random(), 1.0],
-                state: [0.0; 4], // 0 potential
+                state: [0.0; 4],
             });
         }
 
@@ -103,7 +93,7 @@ impl BrainSystem {
             depth_or_array_layers: 1,
         };
 
-        let input_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let input_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Eye Input"),
             size: tex_size,
             mip_level_count: 1,
@@ -112,10 +102,10 @@ impl BrainSystem {
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
-        let input_view = input_texture.create_view(&Default::default());
+        }));
+        let input_view = Arc::new(input_texture.create_view(&Default::default()));
 
-        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let output_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Brain Hallucination"),
             size: tex_size,
             mip_level_count: 1,
@@ -124,8 +114,8 @@ impl BrainSystem {
             format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let output_view = output_texture.create_view(&Default::default());
+        }));
+        let output_view = Arc::new(output_texture.create_view(&Default::default()));
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -153,7 +143,6 @@ impl BrainSystem {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Brain Layout"),
             entries: &[
-                // Neurons
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
@@ -164,7 +153,6 @@ impl BrainSystem {
                     },
                     count: None,
                 },
-                // Params
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -175,7 +163,6 @@ impl BrainSystem {
                     },
                     count: None,
                 },
-                // Input Texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -186,14 +173,12 @@ impl BrainSystem {
                     },
                     count: None,
                 },
-                // Sampler
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // Output Storage Texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -253,7 +238,6 @@ impl BrainSystem {
             cache: None,
         });
 
-        // Re-use standard vertex/index logic for cubes
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(vertex::VERTICES_CUBE),
@@ -265,7 +249,6 @@ impl BrainSystem {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        // Render pipeline (Vertex shader needs to be in brain.wgsl too)
         let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             bind_group_layouts: &[&bind_group_layout, camera_bind_group_layout],
             ..Default::default()
@@ -276,7 +259,7 @@ impl BrainSystem {
             layout: Some(&render_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"), // We need to add this to brain.wgsl or reuse neurons.wgsl logic
+                entry_point: Some("vs_main"),
                 buffers: &[vertex::create_vertex_buffer_layout()],
                 compilation_options: Default::default(),
             },
@@ -325,10 +308,7 @@ impl BrainSystem {
 
     pub fn update(&mut self, input: &crate::input::Input, window_size: (u32, u32)) {
         self.params.time = self.start_time.elapsed().as_secs_f32();
-
-        // Update Mouse
         let (mx, my) = input.mouse_position();
-        // Normalize mouse to -1..1 range relative to center of screen
         self.params.mouse_x = (mx as f32 / window_size.0 as f32) * 2.0 - 1.0;
         self.params.mouse_y = -((my as f32 / window_size.1 as f32) * 2.0 - 1.0);
         self.params.is_clicking = if input.is_mouse_button_down(winit::event::MouseButton::Left) {
@@ -337,11 +317,8 @@ impl BrainSystem {
             0
         };
 
-        // Check for new camera frame
         if let Some(img) = self.camera.get_frame() {
-            // Resize if needed, or simple upload
             let img = image::imageops::resize(&img, 512, 512, image::imageops::FilterType::Nearest);
-
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.input_texture,
@@ -374,7 +351,6 @@ impl BrainSystem {
         depth: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
-        // 1. Compute
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Brain Think"),
@@ -385,8 +361,6 @@ impl BrainSystem {
             let groups = (self.params.count + 63) / 64;
             cpass.dispatch_workgroups(groups, 1, 1);
         }
-
-        // 2. Render Neurons
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Brain Draw"),
@@ -418,8 +392,20 @@ impl BrainSystem {
         }
     }
 
-    // Helper to get views for ImGui debug
-    pub fn get_views(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
-        (&self.input_texture_view, &self.output_texture_view)
+    // Helper to get Shared Texture resources for ImGui
+    pub fn get_textures(
+        &self,
+    ) -> (
+        Arc<wgpu::Texture>,
+        Arc<wgpu::TextureView>,
+        Arc<wgpu::Texture>,
+        Arc<wgpu::TextureView>,
+    ) {
+        (
+            self.input_texture.clone(),
+            self.input_texture_view.clone(),
+            self.output_texture.clone(),
+            self.output_texture_view.clone(),
+        )
     }
 }

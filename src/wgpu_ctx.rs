@@ -1,20 +1,20 @@
 // src/wgpu_ctx.rs
-use crate::{BrainSystem, Camera, CameraUniform, ImguiState, Input, ShaderHotReload, Transform};
+use crate::{BrainSystem, ImguiState, Input};
 use cgmath::{Matrix4, SquareMatrix};
 use hecs::World;
 use imgui::*;
-use imgui_wgpu::{Renderer, RendererConfig};
+use imgui_wgpu::{Renderer, RendererConfig, Texture as ImguiTexture};
 use imgui_winit_support::WinitPlatform;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-// --- Minimal Shader Hot Reload (Kept for tweaking brain logic) ---
+// --- ShaderHotReload Definition ---
 pub struct ShaderHotReload {
     device: Arc<wgpu::Device>,
     shader_dir: PathBuf,
@@ -31,11 +31,8 @@ impl ShaderHotReload {
     }
 
     pub fn get_shader(&self, name: &str) -> wgpu::ShaderModule {
-        // Simplified for brevity: In a real app, use the file watcher logic
-        // For MVP, we try to load from disk, otherwise panic or fallback
         let path = self.shader_dir.join(name);
         let source = fs::read_to_string(&path).unwrap_or_else(|_| {
-            // Panic or return embedded fallback if file missing
             panic!("Shader not found: {}", path.display());
         });
 
@@ -44,6 +41,33 @@ impl ShaderHotReload {
                 label: Some(name),
                 source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
             })
+    }
+}
+
+// --- CameraUniform Definition ---
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CameraUniform {
+    pub view_proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
+    pub camera_position: [f32; 3],
+    pub _padding0: u32,
+    pub time: f32,
+    pub _padding1: [u8; 12],
+}
+
+impl Default for CameraUniform {
+    fn default() -> Self {
+        Self {
+            view_proj: Matrix4::identity().into(),
+            inv_view_proj: Matrix4::identity().into(),
+            view: Matrix4::identity().into(),
+            camera_position: [0.0; 3],
+            _padding0: 0,
+            time: 0.0,
+            _padding1: [0; 12],
+        }
     }
 }
 
@@ -91,7 +115,7 @@ impl<'window> WgpuCtx<'window> {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::FLOAT32_FILTERABLE, // Important for Brain Textures
+                    required_features: wgpu::Features::FLOAT32_FILTERABLE,
                     required_limits: wgpu::Limits::default(),
                     ..Default::default()
                 },
@@ -103,9 +127,10 @@ impl<'window> WgpuCtx<'window> {
         let device = Arc::new(device);
         let queue = Arc::new(queue);
         let size = window.inner_size();
-        let surface_config = surface
+        let mut surface_config = surface
             .get_default_config(&adapter, size.width, size.height)
             .unwrap();
+        surface_config.present_mode = wgpu::PresentMode::AutoNoVsync;
         surface.configure(&device, &surface_config);
 
         // 2. Utils
@@ -166,7 +191,6 @@ impl<'window> WgpuCtx<'window> {
         let depth_texture_view = depth_texture.create_view(&Default::default());
 
         // 5. Initialize The Brain
-        // Replace this URL with your actual IP Webcam URL
         let camera_url = "http://192.168.1.65:8080/shot.jpg".to_string();
 
         let brain_system = BrainSystem::new(
@@ -180,14 +204,50 @@ impl<'window> WgpuCtx<'window> {
         // 6. Init ImGui
         let mut imgui = Self::init_imgui(&device, &queue, &window, surface_config.format);
 
-        // Register Brain Textures with ImGui Renderer so we can see them
-        let (input_view, output_view) = brain_system.get_views();
+        // Register Brain Textures with ImGui Renderer using from_raw_parts
+        let (in_tex, in_view, out_tex, out_view) = brain_system.get_textures();
+        let brain_tex_size = wgpu::Extent3d {
+            width: 512,
+            height: 512,
+            depth_or_array_layers: 1,
+        };
 
-        // We register them once here.
-        // NOTE: If window resizes and we recreate brain textures, we must update these IDs.
-        // For this simplified version, we assume brain textures are fixed size (512x512).
-        let input_texture_id = Some(imgui.renderer.textures.insert(input_view.clone()));
-        let output_texture_id = Some(imgui.renderer.textures.insert(output_view.clone()));
+        // Config for sampler creation inside from_raw_parts
+        let raw_config = imgui_wgpu::RawTextureConfig {
+            label: Some("Brain Sampler"),
+            sampler_desc: wgpu::SamplerDescriptor {
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            },
+        };
+
+        let input_tex_struct = ImguiTexture::from_raw_parts(
+            &device,
+            &imgui.renderer,
+            in_tex,
+            in_view,
+            None,
+            Some(&raw_config),
+            brain_tex_size,
+        );
+
+        let output_tex_struct = ImguiTexture::from_raw_parts(
+            &device,
+            &imgui.renderer,
+            out_tex,
+            out_view,
+            None,
+            Some(&raw_config),
+            brain_tex_size,
+        );
+
+        let input_texture_id = Some(imgui.renderer.textures.insert(input_tex_struct));
+        let output_texture_id = Some(imgui.renderer.textures.insert(output_tex_struct));
 
         Self {
             surface,
@@ -206,7 +266,7 @@ impl<'window> WgpuCtx<'window> {
         }
     }
 
-    pub fn draw(&mut self, world: &mut World, window: &Window, input: &Input) {
+    pub fn draw(&mut self, _world: &mut World, window: &Window, input: &Input) {
         // 1. Update CPU State
         let window_size = (self.surface_config.width, self.surface_config.height);
         self.brain_system.update(input, window_size);
@@ -218,7 +278,6 @@ impl<'window> WgpuCtx<'window> {
 
         // 3. Render The Brain (Compute + 3D Draw)
         {
-            // First, clear the screen manually since BrainSystem draws on top
             let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -239,10 +298,8 @@ impl<'window> WgpuCtx<'window> {
                 }),
                 ..Default::default()
             });
-            // Pass drops here
         }
 
-        // Draw the 3D Neurons
         self.brain_system.render(
             &mut encoder,
             &self.camera_bind_group,
@@ -281,7 +338,7 @@ impl<'window> WgpuCtx<'window> {
             .position([10.0, 10.0], Condition::FirstUseEver)
             .size([600.0, 400.0], Condition::FirstUseEver)
             .build(|| {
-                ui.text("FPS: %.1f");
+                ui.text(format!("FPS: {:.1}", ui.io().framerate));
                 ui.separator();
 
                 // Show Inputs/Outputs Side by Side
@@ -336,7 +393,6 @@ impl<'window> WgpuCtx<'window> {
         self.surface_config.height = new_size.1.max(1);
         self.surface.configure(&self.device, &self.surface_config);
 
-        // Recreate depth
         let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth"),
             size: wgpu::Extent3d {
@@ -352,8 +408,6 @@ impl<'window> WgpuCtx<'window> {
             view_formats: &[],
         });
         self.depth_texture_view = depth_texture.create_view(&Default::default());
-
-        // Note: We don't resize the brain textures (512x512) as that resets their memory (forgetting).
     }
 
     pub fn update_camera_uniform(
@@ -375,7 +429,6 @@ impl<'window> WgpuCtx<'window> {
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[u]));
     }
 
-    // Helper for Imgui Init
     fn init_imgui(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

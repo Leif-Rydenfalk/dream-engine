@@ -1,5 +1,4 @@
 use crate::*;
-use cgmath::One;
 use cgmath::Rotation3;
 use cgmath::{perspective, InnerSpace, Matrix4, Point3, Quaternion, Rad, Vector3, Zero};
 use hecs::World;
@@ -65,8 +64,8 @@ impl Default for CameraController {
 }
 
 pub fn update_camera_system(world: &mut World, input: &Input, dt: Duration) {
-    for (_, (transform, camera, controller)) in
-        world.query_mut::<(&mut Transform, &mut Camera, &mut CameraController)>()
+    for (_, (transform, _camera, controller)) in
+        world.query_mut::<(&mut Transform, &Camera, &mut CameraController)>()
     {
         let dt = dt.as_secs_f32();
 

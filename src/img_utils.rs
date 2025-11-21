@@ -33,6 +33,8 @@ fn read_file_to_memory(filename: &str) -> io::Result<Vec<u8>> {
     file.read_to_end(&mut buffer)?;
     Ok(buffer)
 }
+
+#[cfg(test)]
 mod test {
     use crate::img_utils::RgbaImg;
 
