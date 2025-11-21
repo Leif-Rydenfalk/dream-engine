@@ -1,10 +1,18 @@
-// --- Structures matching Rust ---
+// src/shaders/brain.wgsl
+
+// --- Structs ---
 
 struct Neuron {
-    pos: vec4<f32>,    // xyz: Position, w: unused
-    weight: vec4<f32>, // xyz: Semantic Weight, w: Strength
-    state: vec4<f32>,  // x: Voltage, y: Fatigue, z: Firing (0/1), w: Unused
-}
+    pos_physical: vec4<f32>, // xyz: Location in brain, w: unused
+    pos_semantic: vec4<f32>, // xyz: Location in concept space, w: unused
+    
+    // State Vector:
+    // x: Voltage (0.0 to 1.0)
+    // y: Recovery/Fatigue (0.0 to 1.0)
+    // z: Threshold (Homeostatic)
+    // w: Trace (Recent firing memory for Hebbian learning)
+    state: vec4<f32>, 
+};
 
 struct SimParams {
     count: u32,
@@ -14,175 +22,230 @@ struct SimParams {
     mouse_x: f32,
     mouse_y: f32,
     is_clicking: u32,
-    train_mode: u32,
-}
+    train_mode: u32, // 1 = Learning/Input, 0 = Dreaming
+};
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     view: mat4x4<f32>,
     pos: vec3<f32>,
-    padding: u32,
-    time: f32,
-}
+};
 
 // --- Bindings ---
-// Group 0: Brain System
+
 @group(0) @binding(0) var<storage, read_write> neurons: array<Neuron>;
 @group(0) @binding(1) var<uniform> params: SimParams;
-@group(0) @binding(2) var input_tex: texture_2d<f32>;
-@group(0) @binding(3) var samp: sampler;
-@group(0) @binding(4) var output_tex: texture_storage_2d<rgba32float, write>;
-@group(0) @binding(5) var concept_map: texture_storage_3d<r32uint, read_write>;
+@group(0) @binding(2) var input_texture: texture_2d<f32>;
+@group(0) @binding(3) var input_sampler: sampler;
+@group(0) @binding(4) var output_texture: texture_storage_2d<rgba32float, write>;
 
-// Group 1: Camera (For rendering 3D view)
+// The "Field" - A Linearized 3D Density Map of semantic activity
+// Replaces texture_storage_3d to allow generic atomics
+@group(0) @binding(5) var<storage, read_write> concept_map: array<atomic<u32>>;
+
 @group(1) @binding(0) var<uniform> camera: CameraUniform;
 
 // --- Constants ---
-const GRID_SIZE: u32 = 32u;
 
-// --- COMPUTE: Clear Grid ---
-// Clears the 3D spatial map before neurons write to it
-@compute @workgroup_size(8, 8, 8)
-fn cs_clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= GRID_SIZE || id.y >= GRID_SIZE || id.z >= GRID_SIZE) {
-        return;
-    }
-    // FIX: Cast id to vec3<i32> for textureStore
-    textureStore(concept_map, vec3<i32>(id), vec4<u32>(0u));
+const GRID_SIZE: u32 = 64u; // Must match Rust const
+const GRID_SIZE_SQ: u32 = 4096u; // 64 * 64
+const DT: f32 = 0.016;
+const DECAY: f32 = 0.90;
+const RECOVERY_RATE: f32 = 0.05;
+const LEARNING_RATE: f32 = 0.01;
+const NOISE: f32 = 0.001;
+
+// --- Helpers ---
+
+fn get_grid_index(p: vec3<i32>) -> u32 {
+    return u32(p.x) + u32(p.y) * GRID_SIZE + u32(p.z) * GRID_SIZE_SQ;
 }
 
-// --- COMPUTE: Populate Grid ---
-// Neurons register their index into the 3D voxel grid
-@compute @workgroup_size(64, 1, 1)
+// Hash function for pseudo-randomness
+fn hash(n: u32) -> f32 {
+    var x = n;
+    x = (x << 13u) ^ x;
+    return (1.0 - f32((x * (x * x * 15731u + 789221u) + 1376312589u) & 0x7fffffffu) / 1073741824.0);
+}
+
+fn float_to_uint(val: f32) -> u32 {
+    return u32(max(0.0, val) * 1000.0);
+}
+
+fn uint_to_float(val: u32) -> f32 {
+    return f32(val) / 1000.0;
+}
+
+// --- Compute Pass 1: Clear the Concept Field ---
+@compute @workgroup_size(64)
+fn cs_clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    // Total voxels = 64*64*64 = 262,144
+    if (idx >= (GRID_SIZE * GRID_SIZE * GRID_SIZE)) { return; }
+    atomicStore(&concept_map[idx], 0u);
+}
+
+// --- Compute Pass 2: Emit Signals & Handle Input ---
+@compute @workgroup_size(64)
 fn cs_populate_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= params.count) { return; }
-
-    let pos = neurons[idx].pos.xyz;
     
-    // Map world position (-2.5 to 2.5) to Grid Coords (0 to 32)
-    let grid_pos = vec3<u32>((pos + vec3<f32>(2.5)) * (f32(GRID_SIZE) / 5.0));
+    var n = neurons[idx];
     
-    if (grid_pos.x < GRID_SIZE && grid_pos.y < GRID_SIZE && grid_pos.z < GRID_SIZE) {
-        // FIX: Cast grid_pos to vec3<i32>
-        textureStore(concept_map, vec3<i32>(grid_pos), vec4<u32>(idx));
+    // 1. Sensory Input (Optic Nerve)
+    if (params.train_mode == 1u && idx < (params.width * params.height)) {
+        let uv = vec2<f32>(
+            f32(idx % params.width) / f32(params.width),
+            f32(idx / params.width) / f32(params.height)
+        );
+        let color = textureSampleLevel(input_texture, input_sampler, uv, 0.0);
+        // Stimulation
+        n.state.x += length(color.rgb) * 0.5; 
     }
+
+    // 2. Emit to Field (Atomic Add to Buffer)
+    if (n.state.x > 0.1) {
+        let grid_pos = vec3<i32>((n.pos_semantic.xyz + 1.0) * 0.5 * f32(GRID_SIZE));
+        
+        if (grid_pos.x >= 0 && grid_pos.x < i32(GRID_SIZE) &&
+            grid_pos.y >= 0 && grid_pos.y < i32(GRID_SIZE) &&
+            grid_pos.z >= 0 && grid_pos.z < i32(GRID_SIZE)) {
+            
+            let density = float_to_uint(n.state.x);
+            let buffer_idx = get_grid_index(grid_pos);
+            atomicAdd(&concept_map[buffer_idx], density);
+        }
+    }
+
+    neurons[idx] = n;
 }
 
-// --- COMPUTE: Update Neurons ---
-// The main brain loop: Read Input -> Calculate Voltage -> Fire -> Write Output
-@compute @workgroup_size(64, 1, 1)
+// --- Compute Pass 3: Update Logic & Plasticity ---
+@compute @workgroup_size(64)
 fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= params.count) { return; }
+    
+    var n = neurons[idx];
+    var voltage = n.state.x;
+    var recovery = n.state.y;
+    var threshold = n.state.z;
+    var trace = n.state.w;
 
-    var neuron = neurons[idx];
+    // --- 1. Synaptic Integration (Reading the Buffer) ---
+    let grid_pos = vec3<i32>((n.pos_semantic.xyz + 1.0) * 0.5 * f32(GRID_SIZE));
+    var input_current = 0.0;
 
-    // 1. Read Sensory Input (Optic Nerve)
-    // Map 3D position to 2D UV coordinates (Projecting Z depth to flat image)
-    let uv = (neuron.pos.xy / 5.0) + 0.5; // Map -2.5..2.5 to 0..1
-    
-    var sensory_input: vec4<f32> = vec4<f32>(0.0);
-    
-    if (params.train_mode == 1u && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-        sensory_input = textureSampleLevel(input_tex, samp, uv, 0.0);
-    }
-
-    // 2. Implicit Connectivity (Dendrites)
-    let grid_pos = vec3<u32>((neuron.pos.xyz + vec3<f32>(2.5)) * (f32(GRID_SIZE) / 5.0));
-    var neighbor_input: f32 = 0.0;
-    
-    // FIX: Removed the 3rd argument (0) and cast grid_pos to i32
-    let neighbor_id = textureLoad(concept_map, vec3<i32>(grid_pos)).r;
-    
-    if (neighbor_id != 0u && neighbor_id != idx) {
-        let neighbor = neurons[neighbor_id];
-        if (neighbor.state.z > 0.5) { // If neighbor is firing
-            neighbor_input += 0.05; // Excite
+    // Sample 3x3x3 volume
+    for (var z = -1; z <= 1; z++) {
+        for (var y = -1; y <= 1; y++) {
+            for (var x = -1; x <= 1; x++) {
+                let sample_pos = grid_pos + vec3<i32>(x, y, z);
+                if (sample_pos.x >= 0 && sample_pos.x < i32(GRID_SIZE) &&
+                    sample_pos.y >= 0 && sample_pos.y < i32(GRID_SIZE) &&
+                    sample_pos.z >= 0 && sample_pos.z < i32(GRID_SIZE)) {
+                    
+                    let buffer_idx = get_grid_index(sample_pos);
+                    let field_val = atomicLoad(&concept_map[buffer_idx]);
+                    let density = uint_to_float(field_val);
+                    
+                    let dist = length(vec3<f32>(f32(x), f32(y), f32(z)));
+                    input_current += density * (1.0 / (1.0 + dist * dist));
+                }
+            }
         }
     }
 
-    // 3. Calculate Voltage
-    let perception_match = dot(sensory_input.rgb, neuron.weight.rgb);
-    var delta_voltage = (perception_match * 0.1) + neighbor_input;
+    input_current *= 0.05; 
+
+    // --- 2. Dynamics ---
+    voltage *= DECAY;
+    voltage += input_current;
     
-    // Apply mouse stimulus
-    let mouse_dist = distance(vec2<f32>(params.mouse_x, params.mouse_y), neuron.pos.xy / 2.5);
-    if (params.is_clicking == 1u && mouse_dist < 0.2) {
-        delta_voltage += 0.5;
+    if (recovery > 0.1) {
+        voltage *= 0.5;
+        recovery -= RECOVERY_RATE;
     }
 
-    // Apply to state
-    neuron.state.x += delta_voltage;
-    neuron.state.x *= 0.95; // Decay
+    if (params.train_mode == 0u) {
+         voltage += (hash(idx + u32(params.time * 1000.0)) - 0.5) * 0.05;
+    }
 
-    // 4. Fire?
-    if (neuron.state.x > 0.8 && neuron.state.y < 0.1) {
-        neuron.state.z = 1.0; // FIRE
-        neuron.state.y = 1.0; // Fatigue
-        neuron.state.x = -0.2; // Hyperpolarization
+    var fired = false;
+    if (voltage > threshold) {
+        fired = true;
+        voltage = -0.1;
+        recovery = 1.0;
+        trace = 1.0;
+        threshold += 0.002;
     } else {
-        neuron.state.z = 0.0; 
-        neuron.state.y *= 0.98;
+        threshold = max(0.1, threshold - 0.00001);
+        trace *= 0.95;
     }
 
-    // 5. Hallucinate
-    if (neuron.state.z > 0.5) {
-        let pixel_coord = vec2<i32>(uv * 512.0);
-        if (pixel_coord.x >= 0 && pixel_coord.x < 512 && pixel_coord.y >= 0 && pixel_coord.y < 512) {
-            let output_color = vec4<f32>(neuron.weight.rgb, 1.0);
-            textureStore(output_tex, pixel_coord, output_color);
-        }
-    } else {
-        // Fade trail
-        if (params.time % 0.1 < 0.01) {
-             let pixel_coord = vec2<i32>(uv * 512.0);
-             if (pixel_coord.x >= 0 && pixel_coord.x < 512 && pixel_coord.y >= 0 && pixel_coord.y < 512) {
-                 textureStore(output_tex, pixel_coord, vec4<f32>(0.0));
-             }
+    // --- 3. Plasticity ---
+    if (params.train_mode == 1u) {
+        if (trace > 0.5) {
+             let rnd = vec3<f32>(
+                hash(idx * 3u) - 0.5, 
+                hash(idx * 3u + 1u) - 0.5, 
+                hash(idx * 3u + 2u) - 0.5
+             );
+             n.pos_semantic = vec4<f32>(normalize(n.pos_semantic.xyz + rnd * LEARNING_RATE), 1.0);
         }
     }
 
-    neurons[idx] = neuron;
+    // --- 4. Output ---
+    if (idx < (params.width * params.height)) {
+        let out_uv = vec2<i32>(
+            i32(idx) % i32(params.width),
+            i32(idx) / i32(params.width)
+        );
+        let color = vec4<f32>(n.pos_semantic.xyz * 0.5 + 0.5, 1.0) * (voltage + trace);
+        textureStore(output_texture, out_uv, color);
+    }
+
+    n.state = vec4<f32>(voltage, recovery, threshold, trace);
+    neurons[idx] = n;
 }
 
-// --- RENDER PIPELINE ---
+// --- Rendering (Vertex & Fragment) ---
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) normal: vec3<f32>,
-}
+};
+
+struct InstanceInput {
+    @location(3) pos_physical: vec4<f32>,
+    @location(4) pos_semantic: vec4<f32>,
+    @location(5) state: vec4<f32>,
+};
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec3<f32>,
-}
+    @location(0) color: vec3<f32>,
+};
 
 @vertex
 fn vs_main(
-    @builtin(instance_index) instance_idx: u32,
     model: VertexInput,
+    instance: InstanceInput,
 ) -> VertexOutput {
-    let neuron = neurons[instance_idx];
-    
-    let scale = 0.03;
-    var world_pos = model.position * scale + neuron.pos.xyz;
-
-    var color = neuron.weight.rgb;
-    if (neuron.state.z > 0.5) {
-        color = vec3<f32>(1.0, 1.0, 1.0);
-        world_pos = model.position * (scale * 2.0) + neuron.pos.xyz;
-    } else {
-        color = mix(color, vec3<f32>(0.0), neuron.state.y);
-    }
-
     var out: VertexOutput;
-    out.uv = model.uv;
-    out.color = color;
+    let scale = 0.02 + (instance.state.x * 0.05); 
+    let world_pos = instance.pos_physical.xyz + (model.position * scale);
+    
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    
+    let semantic_color = instance.pos_semantic.xyz * 0.5 + 0.5;
+    let active_color = vec3<f32>(1.0, 0.2, 0.1);
+    
+    out.color = mix(semantic_color * 0.2, active_color, instance.state.x);
+    
     return out;
 }
 
