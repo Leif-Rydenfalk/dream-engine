@@ -84,7 +84,10 @@ pub struct WgpuCtx<'window> {
     pub brain_system: BrainSystem,
 
     pub imgui: ImguiState,
+
+    // ImGui Texture IDs
     input_texture_id: Option<TextureId>,
+    prediction_texture_id: Option<TextureId>, // New field
     output_texture_id: Option<TextureId>,
 
     time: Instant,
@@ -105,8 +108,8 @@ impl<'window> WgpuCtx<'window> {
 
         let required_limits = wgpu::Limits {
             max_compute_invocations_per_workgroup: 512,
-            max_storage_buffer_binding_size: 1 * 1024 * 1024 * 1024, // Request 1GB per buffer
-            max_buffer_size: 1 * 1024 * 1024 * 1024,                 // Request 1GB max buffer
+            max_storage_buffer_binding_size: 1 * 1024 * 1024 * 1024,
+            max_buffer_size: 1 * 1024 * 1024 * 1024,
             ..wgpu::Limits::downlevel_defaults()
         };
 
@@ -190,8 +193,6 @@ impl<'window> WgpuCtx<'window> {
         let depth_texture_view = depth_texture.create_view(&Default::default());
 
         // Initialize Brain
-        // Note: Change this URL to a valid stream or image if needed.
-        // Logic handles timeouts gracefully now.
         let camera_url = "http://192.168.50.208:8080/shot.jpg".to_string();
 
         let brain_system = BrainSystem::new(
@@ -207,7 +208,9 @@ impl<'window> WgpuCtx<'window> {
         let mut imgui = Self::init_imgui(&device, &queue, &window, surface_config.format);
 
         // Register Brain Textures with ImGui
-        let (in_tex, in_view, out_tex, out_view) = brain_system.get_textures();
+        // FIXED: Destructuring 6 items now
+        let (in_tex, in_view, pred_tex, pred_view, out_tex, out_view) = brain_system.get_textures();
+
         let brain_tex_size = wgpu::Extent3d {
             width: 512,
             height: 512,
@@ -237,6 +240,16 @@ impl<'window> WgpuCtx<'window> {
             brain_tex_size,
         );
 
+        let prediction_tex_struct = ImguiTexture::from_raw_parts(
+            &device,
+            &imgui.renderer,
+            pred_tex,
+            pred_view,
+            None,
+            Some(&raw_config),
+            brain_tex_size,
+        );
+
         let output_tex_struct = ImguiTexture::from_raw_parts(
             &device,
             &imgui.renderer,
@@ -248,6 +261,7 @@ impl<'window> WgpuCtx<'window> {
         );
 
         let input_texture_id = Some(imgui.renderer.textures.insert(input_tex_struct));
+        let prediction_texture_id = Some(imgui.renderer.textures.insert(prediction_tex_struct));
         let output_texture_id = Some(imgui.renderer.textures.insert(output_tex_struct));
 
         Self {
@@ -262,6 +276,7 @@ impl<'window> WgpuCtx<'window> {
             brain_system,
             imgui,
             input_texture_id,
+            prediction_texture_id,
             output_texture_id,
             time: Instant::now(),
         }
@@ -306,17 +321,17 @@ impl<'window> WgpuCtx<'window> {
         {
             let ui = self.imgui.context.frame();
 
-            ui.window("Hybrid Neural Chassis")
+            ui.window("Predictive Coding Chassis")
                 .position([10.0, 10.0], Condition::FirstUseEver)
-                .size([400.0, 600.0], Condition::FirstUseEver)
+                .size([500.0, 600.0], Condition::FirstUseEver)
                 .build(|| {
                     ui.text(format!("FPS: {:.1}", ui.io().framerate));
                     ui.separator();
 
                     let mode_text = if self.brain_system.params.train_mode == 1 {
-                        "Mode: LEARNING (Active)"
+                        "Mode: LEARNING (Active Plasticity)"
                     } else {
-                        "Mode: DREAMING (Inference)"
+                        "Mode: INFERENCE (Weights Frozen)"
                     };
                     ui.text(mode_text);
                     if ui.button("Toggle Mode (Space)") {
@@ -329,66 +344,52 @@ impl<'window> WgpuCtx<'window> {
                     }
                     ui.separator();
 
-                    ui.text("Geometric Connectivity");
+                    ui.text("Architecture: Predictive Coding (HGF)");
+                    ui.text("- Retina computes (Reality - Prediction)");
+                    ui.text("- Cortex minimizes Error via Learning");
+
+                    ui.separator();
+                    ui.text("Params");
+
                     let mut samples = self.brain_system.params.geometric_sample_count as i32;
-                    if ui.slider("Sample Count", 32, 256, &mut samples) {
+                    if ui.slider("Samples/Frame", 16, 128, &mut samples) {
                         self.brain_system.params.geometric_sample_count = samples as u32;
                     }
 
-                    ui.slider(
-                        "Inhibit Radius",
-                        0.0,
-                        1.0,
-                        &mut self.brain_system.kernel.inhibit_radius,
-                    );
-                    ui.slider(
-                        "Inhibit Strength",
-                        0.0,
-                        2.0,
-                        &mut self.brain_system.kernel.inhibit_strength,
-                    );
-
-                    ui.separator();
-                    ui.text("Explicit Synapses");
                     ui.slider(
                         "Learning Rate",
                         0.0,
                         0.5,
                         &mut self.brain_system.kernel.explicit_learning_rate,
                     );
-                    ui.slider(
-                        "Pruning Threshold",
-                        1.0,
-                        20.0,
-                        &mut self.brain_system.kernel.pruning_threshold,
-                    );
 
-                    ui.separator();
-                    ui.text("Terror Dynamics");
                     ui.slider(
-                        "Terror Threshold",
-                        0.01,
+                        "Promotion Threshold",
+                        0.1,
                         1.0,
-                        &mut self.brain_system.params.terror_threshold,
-                    );
-                    ui.slider(
-                        "Temporal Decay",
-                        0.01,
-                        0.5,
-                        &mut self.brain_system.kernel.temporal_decay,
+                        &mut self.brain_system.kernel.promotion_threshold,
                     );
 
                     ui.separator();
 
-                    if let (Some(in_id), Some(out_id)) =
-                        (self.input_texture_id, self.output_texture_id)
-                    {
-                        ui.columns(2, "cam_cols", true);
-                        ui.text("Retina");
-                        Image::new(in_id, [128.0, 128.0]).build(ui);
+                    // FIXED: Display 3 Columns
+                    if let (Some(in_id), Some(pred_id), Some(out_id)) = (
+                        self.input_texture_id,
+                        self.prediction_texture_id,
+                        self.output_texture_id,
+                    ) {
+                        ui.columns(3, "cam_cols", true);
+                        ui.text("Reality (Input)");
+                        Image::new(in_id, [120.0, 120.0]).build(ui);
                         ui.next_column();
-                        ui.text("Cortex");
-                        Image::new(out_id, [128.0, 128.0]).build(ui);
+
+                        ui.text("Dream (Pred)");
+                        Image::new(pred_id, [120.0, 120.0]).build(ui);
+                        ui.next_column();
+
+                        ui.text("Cortex (Error)");
+                        Image::new(out_id, [120.0, 120.0]).build(ui);
+
                         ui.columns(1, "reset", false);
                     }
                 });
