@@ -82,8 +82,13 @@ struct LineVertex {
 // --- UTILITY ---
 
 fn hash_to_grid(pos: vec3<f32>) -> u32 {
+    // Expand the simulation bounds to [-4, 4] to catch edge cases
     let grid_size = f32(params.grid_dim);
-    let scaled = (pos + vec3<f32>(4.0)) / 8.0;
+    
+    // Mapping [-2, 2] world space to [0, 1] for grid
+    // (Since we multiply concept_pos by 3.0 in render, physics is roughly -1 to 1)
+    let scaled = (pos + vec3<f32>(2.0)) / 4.0; 
+    
     let cell = vec3<u32>(clamp(scaled * grid_size, vec3<f32>(0.0), vec3<f32>(grid_size - 1.0)));
     return cell.x + cell.y * params.grid_dim + cell.z * params.grid_dim * params.grid_dim;
 }
@@ -180,46 +185,51 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     var n: Neuron;
     let seed = idx * 1000u;
     
-    // --- LAYER ASSIGNMENT ---
-    // First 16,384 neurons (128x128) are the RETINA
-    let retina_count = 128u * 128u; // 16,384
+    // --- ADJUSTED FOR 500k TOTAL ---
+    
+    // 1. RETINA: 320x320 = 102,400 neurons
+    // Enough resolution to track objects, but leaves room for brain.
+    let retina_dim = 320u;
+    let retina_count = retina_dim * retina_dim; 
+    
+    // 2. CORTEX: ~250,000 neurons
+    // The main processing chunk
+    let cortex_count = 250000u; 
     
     if (idx < retina_count) {
         // LAYER 0: RETINA
         n.layer = 0u;
-        n.retinal_coord = vec2<u32>(idx % 128u, idx / 128u);
+        n.retinal_coord = vec2<u32>(idx % retina_dim, idx / retina_dim);
         
-        // Map 0..128 to -1..1 for position
-        let u = f32(n.retinal_coord.x) / 128.0;
-        let v = f32(n.retinal_coord.y) / 128.0;
+        // UV mapping
+        let u = f32(n.retinal_coord.x) / f32(retina_dim);
+        let v = f32(n.retinal_coord.y) / f32(retina_dim);
         
         n.cortical_pos = vec2<f32>(u * 2.0 - 1.0, v * 2.0 - 1.0);
-        // Place Retina at Z = -2.0
         n.concept_pos = vec3<f32>(n.cortical_pos, -0.8); 
-        n.learning_rate = 0.0; // Retina doesn't learn, it observes
+        n.learning_rate = 0.0; 
     } 
-    else if (idx < retina_count + 40000u) {
-        // LAYER 1: CORTEX (Feature Extraction)
+    else if (idx < retina_count + cortex_count) {
+        // LAYER 1: CORTEX
         n.layer = 1u;
         n.retinal_coord = vec2<u32>(0u, 0u);
         
-        // Random positions in Z = 0.0 plane
+        // Spread them out well in the center
         n.cortical_pos = vec2<f32>(rand(seed), rand(seed+1u)) * 2.0 - 1.0;
         n.concept_pos = vec3<f32>(n.cortical_pos, 0.0 + (rand(seed+2u)*0.4 - 0.2));
-        n.learning_rate = 0.02; // Fast learning for features
+        n.learning_rate = 0.02; 
     } 
     else {
-        // LAYER 2: HIPPOCAMPUS (Temporal/Sequence)
+        // LAYER 2: HIPPOCAMPUS (Remainder)
+        // ~147,600 neurons left
         n.layer = 2u;
         n.retinal_coord = vec2<u32>(0u, 0u);
         
-        // Random positions in Z = +0.8 plane
         n.cortical_pos = vec2<f32>(rand(seed), rand(seed+1u)) * 2.0 - 1.0;
         n.concept_pos = vec3<f32>(n.cortical_pos, 0.8 + (rand(seed+2u)*0.4 - 0.2));
-        n.learning_rate = 0.005; // Slow learning for long sequences
+        n.learning_rate = 0.005; 
     }
 
-    // Standard init for rest
     n.receptive_center = vec3<f32>(rand(seed + 20u), rand(seed + 21u), rand(seed + 22u)) * 2.0 - 1.0;
     n.receptive_scale = 0.5 + rand(seed + 30u) * 0.5;
     
@@ -273,16 +283,16 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     if (post.layer == 0u) {
         // SENSING MODE (Awake)
         if (params.train_mode == 1u) {
-            let val = textureSampleLevel(input_tex, input_sampler, post.cortical_pos * 0.5 + 0.5, 0.0).r;
+            // Use exact integer coordinates for crisp input
+            let val = textureLoad(input_tex, post.retinal_coord, 0).r;
             
-            // Map luminance 0..1 to Voltage -1..1
-            // High contrast input
-            post.voltage = (val - 0.5) * 2.5; 
+            post.voltage = (val - 0.5) * 3.0; // Increased contrast
+            post.voltage = clamp(post.voltage, -1.0, 1.0);
             post.plasticity_trace = post.voltage;
             
             neurons[post_idx] = post;
             return; 
-        } 
+        }
         // DREAM MODE (Asleep)
         else {
             // Top-Down Reconstruction:
@@ -322,7 +332,7 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
             return;
         }
     }
-    
+
     // ==========================================
     // PHASE 2: SYNAPTIC INTEGRATION
     // ==========================================
@@ -575,16 +585,26 @@ fn vs_main(
     var out: VertexOutput;
     
     let neuron = neurons[instance_idx];
-    let world_pos = neuron.concept_pos * 3.0 + vertex_pos * 0.04;
+    
+    // Reduce size: 0.01 instead of 0.04
+    let world_pos = neuron.concept_pos * 3.0 + vertex_pos * 0.01; 
+    
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     
     let activity = neuron.voltage;
-    let surprise = neuron.surprise_accumulator;
-    let base = abs(neuron.concept_pos) * 0.3;
-    let active_color = vec3<f32>(0.0, 1.0, 1.0) * max(0.0, activity);
-    let terror_color = vec3<f32>(1.0, 0.0, 0.0) * surprise;
+    let trace = neuron.plasticity_trace; // Visualize the trace
     
-    out.color = base + active_color + terror_color;
+    // Layer Colors
+    var base_color = vec3<f32>(0.1);
+    if (neuron.layer == 0u) { base_color = vec3<f32>(0.1, 0.1, 0.1); } // Retina (Dark)
+    if (neuron.layer == 1u) { base_color = vec3<f32>(0.1, 0.0, 0.1); } // Cortex (Purple base)
+    if (neuron.layer == 2u) { base_color = vec3<f32>(0.0, 0.1, 0.1); } // Hippo (Teal base)
+
+    let active_color = vec3<f32>(0.0, 1.0, 1.0) * max(0.0, activity);
+    // Show recent memory (trace) as Green
+    let trace_color = vec3<f32>(0.0, 1.0, 0.0) * trace * 0.5; 
+    
+    out.color = base_color + active_color + trace_color;
     return out;
 }
 

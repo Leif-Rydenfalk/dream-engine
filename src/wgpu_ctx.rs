@@ -103,17 +103,20 @@ impl<'window> WgpuCtx<'window> {
             .await
             .expect("No adapter");
 
+        let required_limits = wgpu::Limits {
+            max_compute_invocations_per_workgroup: 512,
+            max_storage_buffer_binding_size: 1 * 1024 * 1024 * 1024, // Request 1GB per buffer
+            max_buffer_size: 1 * 1024 * 1024 * 1024,                 // Request 1GB max buffer
+            ..wgpu::Limits::downlevel_defaults()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     required_features: wgpu::Features::FLOAT32_FILTERABLE
                         | wgpu::Features::VERTEX_WRITABLE_STORAGE
                         | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-                    required_limits: wgpu::Limits {
-                        max_compute_invocations_per_workgroup: 512,
-                        max_storage_buffer_binding_size: 512 * 1024 * 1024,
-                        ..wgpu::Limits::default()
-                    },
+                    required_limits,
                     ..Default::default()
                 },
                 None,

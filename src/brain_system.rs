@@ -3,10 +3,11 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-// Configuration
-const NEURON_COUNT: u32 = 65_536; // Power of 2 helps workgroups
-const GRID_DIM: u32 = 64;
-const EXPLICIT_SLOTS: usize = 32;
+// Update constants at the top
+// const NEURON_COUNT: u32 = 1_048_576; // 1 Million (1024 x 1024)
+const NEURON_COUNT: u32 = 448_576;
+const GRID_DIM: u32 = 128; // Finer grid for more neurons
+const EXPLICIT_SLOTS: usize = 32; // Keep at 32 for now (1M * 32 = 32 Million synapses!)
 
 // --- GPU STRUCTS ---
 // MUST match the WGSL struct padding exactly (16-byte alignment)
@@ -142,9 +143,9 @@ impl BrainSystem {
             neuron_count: NEURON_COUNT,
             time: 0.0,
             dt: 0.016,
-            geometric_sample_count: 64,
+            geometric_sample_count: 32, // Reduce slightly to 32 to maintain 60fps with 1M neurons
             explicit_synapse_slots: EXPLICIT_SLOTS as u32,
-            train_mode: 1, // Start in awake/learning mode
+            train_mode: 1,
             terror_threshold: 0.5,
             grid_dim: GRID_DIM,
             _pad: [0.0; 4],
