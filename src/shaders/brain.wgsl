@@ -78,29 +78,49 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     var me = neurons[idx];
 
     // ==========================================
-    // PHASE 1: THE DREAM (Prediction)
+    // PHASE 1: THE DREAM (Monte Carlo Sampling)
     // ==========================================
-    // I do not see the camera yet. I only see my neighbors.
     
     var neighbor_activity_sum = 0.0;
-    let my_grid_idx = hash_coords(me.pos_semantic.xyz);
+    var connection_count = 0.0;
     
-    // Check the spatial hash map for a neighbor
-    let neighbor_id = atomicLoad(&spatial_grid[my_grid_idx]);
-    
-    // Self-excitation (Memory)
-    neighbor_activity_sum += me.state.x * 0.9; 
+    // Self-Memory (The "Ghosting")
+    neighbor_activity_sum += me.state.x * 0.9;
+    connection_count += 1.0;
 
-    // Neighbor-excitation
-    if (neighbor_id != 0xFFFFFFFFu && neighbor_id != idx) {
-        let other = neurons[neighbor_id];
-        // If someone with my Concept (Color) is active, I get excited.
-        // This is "Pattern Completion".
-        neighbor_activity_sum += other.state.x * 0.15;
+    // We will sample 8 random locations around my concept
+    // effectively "casting a net" to catch nearby neurons
+    for (var i = 0u; i < 8u; i++) {
+        
+        // Generate a random offset based on ID and Iteration
+        let jitter = rand_vec3(idx + i * 1000u + u32(params.time * 100.0)) * CELL_SIZE;
+        let probe_pos = me.pos_semantic.xyz + jitter;
+        
+        let grid_idx = hash_coords(probe_pos);
+        let neighbor_id = atomicLoad(&spatial_grid[grid_idx]);
+        
+        if (neighbor_id != 0xFFFFFFFFu && neighbor_id != idx) {
+            let other = neurons[neighbor_id];
+            
+            // Are they close enough in color/concept?
+            let dist = distance(me.pos_semantic.xyz, other.pos_semantic.xyz);
+            
+            if (dist < CELL_SIZE) {
+                // Synaptic Weight: Closer = Stronger
+                let weight = 1.0 - (dist / CELL_SIZE);
+                neighbor_activity_sum += other.state.x * weight;
+                connection_count += weight;
+            }
+        }
     }
 
-    // This is the RAW OUTPUT of the network
-    let predicted_activation = clamp(neighbor_activity_sum, 0.0, 1.0);
+    // Average the input
+    if (connection_count > 0.0) {
+        neighbor_activity_sum /= connection_count; // Normalize
+    }
+    
+    // Amplify slightly (Gain Control) so the signal doesn't die
+    let predicted_activation = clamp(neighbor_activity_sum * 1.1, 0.0, 1.0);
 
     // ==========================================
     // PHASE 2: VISUALIZATION (Write Output)
@@ -166,7 +186,8 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         
         // Force state sync for next frame (Hebbian Imprinting)
-        me.state.x = mix(predicted_activation, input_activation, 0.1);
+        // me.state.x = mix(predicted_activation, input_activation, 0.5);
+        me.state.x = mix(predicted_activation, input_activation, 0.001);
         
     } else {
         // DREAM MODE: Closed Loop.
