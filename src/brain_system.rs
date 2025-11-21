@@ -684,6 +684,8 @@ impl BrainSystem {
         depth_view: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
+        const RENDER_3D_VISUALIZATION: bool = true;
+
         // --- COMPUTE PASS ---
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -715,11 +717,14 @@ impl BrainSystem {
             cpass.dispatch_workgroups((self.params.neuron_count + 63) / 64, 1, 1);
 
             // 4. Generate Visualization Lines
-            cpass.set_pipeline(&self.generate_lines_pipeline);
-            cpass.set_bind_group(0, &self.compute_bind_group, &[]);
-            cpass.dispatch_workgroups((self.params.neuron_count + 63) / 64, 1, 1);
+            // OPTIMIZATION: Skip this heavy calculation if we aren't drawing it
+            if RENDER_3D_VISUALIZATION {
+                cpass.set_pipeline(&self.generate_lines_pipeline);
+                cpass.set_bind_group(0, &self.compute_bind_group, &[]);
+                cpass.dispatch_workgroups((self.params.neuron_count + 63) / 64, 1, 1);
+            }
 
-            // 5. Render 2D Cortex View (Optional, for debugging texture)
+            // 5. Render 2D Cortex View (KEEP THIS for ImGui)
             cpass.set_pipeline(&self.render_cortex_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
             cpass.dispatch_workgroups(512 / 8, 512 / 8, 1);
@@ -733,7 +738,7 @@ impl BrainSystem {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), // Clean background
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -749,24 +754,28 @@ impl BrainSystem {
                 occlusion_query_set: None,
             });
 
-            // 1. Draw Lines (Synapses)
-            rpass.set_pipeline(&self.render_pipeline_lines);
-            rpass.set_bind_group(0, &self.empty_bind_group, &[]);
-            rpass.set_bind_group(1, camera_bg, &[]);
-            rpass.set_vertex_buffer(0, self.synapse_line_buffer.slice(..));
-            let vertex_count = self.params.neuron_count * self.params.explicit_synapse_slots * 2;
-            rpass.draw(0..vertex_count, 0..1);
+            // OPTIMIZATION: Skip the actual 3D drawing calls
+            if RENDER_3D_VISUALIZATION {
+                // 1. Draw Lines (Synapses)
+                rpass.set_pipeline(&self.render_pipeline_lines);
+                rpass.set_bind_group(0, &self.empty_bind_group, &[]);
+                rpass.set_bind_group(1, camera_bg, &[]);
+                rpass.set_vertex_buffer(0, self.synapse_line_buffer.slice(..));
+                let vertex_count =
+                    self.params.neuron_count * self.params.explicit_synapse_slots * 2;
+                rpass.draw(0..vertex_count, 0..1);
 
-            // 2. Draw Points (Neurons)
-            rpass.set_pipeline(&self.render_pipeline_points);
-            rpass.set_bind_group(0, &self.render_points_bind_group, &[]);
-            rpass.set_bind_group(1, camera_bg, &[]);
+                // 2. Draw Points (Neurons)
+                rpass.set_pipeline(&self.render_pipeline_points);
+                rpass.set_bind_group(0, &self.render_points_bind_group, &[]);
+                rpass.set_bind_group(1, camera_bg, &[]);
 
-            rpass.set_vertex_buffer(0, self.vertex_buffer_cube.slice(..));
-            rpass.set_index_buffer(self.index_buffer_cube.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(0, self.vertex_buffer_cube.slice(..));
+                rpass.set_index_buffer(self.index_buffer_cube.slice(..), wgpu::IndexFormat::Uint16);
 
-            // Draw 36 indices (Cube) per instance (Neuron)
-            rpass.draw_indexed(0..36, 0, 0..self.params.neuron_count);
+                // Draw 36 indices (Cube) per instance (Neuron)
+                rpass.draw_indexed(0..36, 0, 0..self.params.neuron_count);
+            }
         }
     }
 
