@@ -1,4 +1,3 @@
-// src/wgpu_ctx.rs
 use crate::{BrainSystem, ImguiState, Input};
 use cgmath::{Matrix4, SquareMatrix};
 use hecs::World;
@@ -115,8 +114,13 @@ impl<'window> WgpuCtx<'window> {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::FLOAT32_FILTERABLE,
-                    required_limits: wgpu::Limits::default(),
+                    required_features: wgpu::Features::FLOAT32_FILTERABLE
+                        | wgpu::Features::VERTEX_WRITABLE_STORAGE
+                        | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                    required_limits: wgpu::Limits {
+                        max_compute_invocations_per_workgroup: 512,
+                        ..wgpu::Limits::default()
+                    },
                     ..Default::default()
                 },
                 None,
@@ -191,7 +195,7 @@ impl<'window> WgpuCtx<'window> {
         let depth_texture_view = depth_texture.create_view(&Default::default());
 
         // 5. Initialize The Brain
-        let camera_url = "http://192.168.1.65:8080/shot.jpg".to_string();
+        let camera_url = "http://192.168.50.208:8080/shot.jpg".to_string();
 
         let brain_system = BrainSystem::new(
             Arc::clone(&device),
@@ -199,6 +203,7 @@ impl<'window> WgpuCtx<'window> {
             &camera_bind_group_layout,
             &shader_hot_reload,
             camera_url,
+            surface_config.format, // <--- FIX: Passing the format
         );
 
         // 6. Init ImGui
@@ -326,49 +331,62 @@ impl<'window> WgpuCtx<'window> {
             .io_mut()
             .update_delta_time(now - self.imgui.last_frame);
         self.imgui.last_frame = now;
-        self.imgui
-            .platform
-            .prepare_frame(self.imgui.context.io_mut(), window)
-            .expect("Imgui Fail");
 
-        let ui = self.imgui.context.frame();
+        {
+            let ui = self.imgui.context.frame();
 
-        // --- DASHBOARD WINDOW ---
-        ui.window("Neural Interlink")
-            .position([10.0, 10.0], Condition::FirstUseEver)
-            .size([600.0, 400.0], Condition::FirstUseEver)
-            .build(|| {
-                ui.text(format!("FPS: {:.1}", ui.io().framerate));
-                ui.separator();
+            // --- DASHBOARD WINDOW ---
+            ui.window("Neural Interlink")
+                .position([10.0, 10.0], Condition::FirstUseEver)
+                .size([600.0, 400.0], Condition::FirstUseEver)
+                .build(|| {
+                    ui.text(format!("FPS: {:.1}", ui.io().framerate));
+                    ui.separator();
 
-                // Show Inputs/Outputs Side by Side
-                if let (Some(in_id), Some(out_id)) = (self.input_texture_id, self.output_texture_id)
-                {
-                    ui.columns(2, "cam_cols", true);
+                    // Show Training Mode status
+                    let mode_text = if self.brain_system.get_train_mode() == 1 {
+                        "Mode: TRAINING (Input On)"
+                    } else {
+                        "Mode: DREAMING (Input Off)"
+                    };
+                    ui.text(mode_text);
+                    ui.text("Hold SPACE to toggle Dream Mode");
+                    ui.separator();
 
-                    ui.text("Optic Nerve (Input)");
-                    Image::new(in_id, [256.0, 256.0]).build(ui);
+                    // Show Inputs/Outputs Side by Side
+                    if let (Some(in_id), Some(out_id)) =
+                        (self.input_texture_id, self.output_texture_id)
+                    {
+                        ui.columns(2, "cam_cols", true);
 
-                    ui.next_column();
+                        ui.text("Optic Nerve (Input)");
+                        Image::new(in_id, [256.0, 256.0]).build(ui);
 
-                    ui.text("Visual Cortex (Activity)");
-                    Image::new(out_id, [256.0, 256.0]).build(ui);
+                        ui.next_column();
 
-                    ui.columns(1, "reset", false);
-                }
+                        ui.text("Visual Cortex (Activity)");
+                        Image::new(out_id, [256.0, 256.0]).build(ui);
 
-                ui.separator();
-                ui.text("Controls:");
-                ui.text("- Mouse Wheel: Zoom");
-                ui.text("- Left Click: Electrical Stimulus");
-                ui.text("- W/A/S/D: Move Camera");
-            });
+                        ui.columns(1, "reset", false);
+                    }
 
-        self.imgui.platform.prepare_render(ui, window);
+                    ui.separator();
+                    ui.text("Controls:");
+                    ui.text("- Mouse Wheel: Zoom");
+                    ui.text("- Left Click: Electrical Stimulus");
+                    ui.text("- W/A/S/D: Move Camera");
+                });
+
+            // Prepare the platform (handles cursor, etc.)
+            self.imgui.platform.prepare_render(&ui, window);
+        }
+
+        let draw_data = self.imgui.context.render();
+
         self.imgui
             .renderer
             .render(
-                self.imgui.context.render(),
+                draw_data,
                 &self.queue,
                 &self.device,
                 &mut encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -385,7 +403,7 @@ impl<'window> WgpuCtx<'window> {
                     ..Default::default()
                 }),
             )
-            .unwrap();
+            .expect("Imgui Render Error");
     }
 
     pub fn resize(&mut self, new_size: (u32, u32)) {

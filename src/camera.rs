@@ -19,10 +19,10 @@ impl CameraFeed {
             rt.block_on(async move {
                 let client = reqwest::Client::new();
 
+                println!("Connecting to camera: {}", url);
+
                 loop {
                     // Reconnect loop
-                    println!("Connecting to camera: {}", url);
-
                     // Simple approach: Repeatedly fetch the latest snapshot (snapshot.jpg)
                     // This is often easier than parsing multipart MJPEG streams manually in rust
                     // Most IP webcams expose /shot.jpg or /photo.jpg
