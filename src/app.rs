@@ -33,24 +33,22 @@ impl<'window> ApplicationHandler for App<'window> {
                 .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
             let window = Arc::new(event_loop.create_window(win_attr).unwrap());
 
-            // Async creation wrapper
             let wgpu_ctx = pollster::block_on(WgpuCtx::new_async(window.clone()));
 
             self.window = Some(window.clone());
             self.wgpu_ctx = Some(wgpu_ctx);
             self.world = World::new();
 
-            // Setup Camera
             let window_size = window.inner_size();
             self.camera_entity = Some(setup_camera_entity(
                 &mut self.world,
                 Some((window_size.width, window_size.height)),
             ));
 
-            // Adjust camera start position to see the brain center
             if let Some(e) = self.camera_entity {
                 if let Ok(t) = self.world.query_one_mut::<&mut Transform>(e) {
-                    t.position = Point3::new(0.0, 0.0, -12.0); // Look at 0,0,0
+                    // Z position set to -25.0 to see the whole brain cloud (roughly -6 to +6)
+                    t.position = Point3::new(0.0, 0.0, -25.0);
                 }
             }
         }
@@ -84,7 +82,6 @@ impl<'window> ApplicationHandler for App<'window> {
 
                 update_camera_system(&mut self.world, &self.input_system, dt);
 
-                // Update Camera Uniforms
                 if let (Some(wgpu_ctx), Some(entity)) = (&mut self.wgpu_ctx, self.camera_entity) {
                     if let Ok((t, c)) = self.world.query_one_mut::<(&Transform, &Camera)>(entity) {
                         let view_proj = calculate_view_projection(t, c);
@@ -93,7 +90,6 @@ impl<'window> ApplicationHandler for App<'window> {
                         wgpu_ctx.update_camera_uniform(view_proj, inv, view, t.position.into());
                     }
 
-                    // DRAW
                     wgpu_ctx.draw(
                         &mut self.world,
                         self.window.as_mut().unwrap(),
@@ -102,9 +98,8 @@ impl<'window> ApplicationHandler for App<'window> {
                 }
 
                 self.input_system.update();
-                self.window.as_ref().unwrap().request_redraw(); // Continuous loop
+                self.window.as_ref().unwrap().request_redraw();
             }
-            // Input Handling (Pass to ImGui + Input System)
             WindowEvent::KeyboardInput { event, .. } => {
                 let io = self.wgpu_ctx.as_mut().unwrap().imgui.context.io();
                 if !io.want_capture_keyboard {
@@ -139,7 +134,6 @@ impl<'window> ApplicationHandler for App<'window> {
             _ => (),
         }
 
-        // Pass to ImGui
         if let Some(ctx) = self.wgpu_ctx.as_mut() {
             ctx.imgui.platform.handle_event::<()>(
                 ctx.imgui.context.io_mut(),
@@ -151,11 +145,10 @@ impl<'window> ApplicationHandler for App<'window> {
 }
 
 pub fn setup_camera_entity(world: &mut World, window_size: Option<(u32, u32)>) -> hecs::Entity {
-    // Calculate initial aspect ratio based on window size, or use default if not provided
     let aspect = if let Some((width, height)) = window_size {
         width as f32 / height as f32
     } else {
-        16.0 / 9.0 // Default aspect ratio
+        16.0 / 9.0
     };
 
     world.spawn((

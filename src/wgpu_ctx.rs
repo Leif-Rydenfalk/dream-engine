@@ -343,7 +343,6 @@ impl<'window> WgpuCtx<'window> {
                     ui.text(format!("FPS: {:.1}", ui.io().framerate));
                     ui.separator();
 
-                    // Show Training Mode status
                     let mode_text = if self.brain_system.get_train_mode() == 1 {
                         "Mode: TRAINING (Input On)"
                     } else {
@@ -353,27 +352,21 @@ impl<'window> WgpuCtx<'window> {
                     ui.text("Hold SPACE to toggle Dream Mode");
                     ui.separator();
 
-                    // Show Inputs/Outputs Side by Side
                     if let (Some(in_id), Some(out_id)) =
                         (self.input_texture_id, self.output_texture_id)
                     {
                         ui.columns(2, "cam_cols", true);
-
                         ui.text("Optic Nerve (Input)");
                         Image::new(in_id, [256.0, 256.0]).build(ui);
-
                         ui.next_column();
-
                         ui.text("Visual Cortex (Activity)");
                         Image::new(out_id, [256.0, 256.0]).build(ui);
-
                         ui.columns(1, "reset", false);
                     }
 
                     ui.separator();
                     ui.text("Controls:");
                     ui.text("- Mouse Wheel: Zoom");
-                    ui.text("- Left Click: Electrical Stimulus");
                     ui.text("- W/A/S/D: Move Camera");
                 });
 
