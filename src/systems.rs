@@ -91,7 +91,6 @@ pub fn update_camera_system(world: &mut World, input: &Input, dt: Duration) {
 
         let forward = transform.rotation * -Vector3::unit_z();
         let right = transform.rotation * Vector3::unit_x();
-        let world_up = Vector3::unit_y();
 
         let mut movement_input = Vector3::zero();
         if input.is_key_down(winit::keyboard::KeyCode::KeyW) {
@@ -105,12 +104,6 @@ pub fn update_camera_system(world: &mut World, input: &Input, dt: Duration) {
         }
         if input.is_key_down(winit::keyboard::KeyCode::KeyD) {
             movement_input += right;
-        }
-        if input.is_key_down(winit::keyboard::KeyCode::Space) {
-            movement_input += world_up;
-        }
-        if input.is_key_down(winit::keyboard::KeyCode::ShiftLeft) {
-            movement_input -= world_up;
         }
 
         if movement_input != Vector3::zero() {
