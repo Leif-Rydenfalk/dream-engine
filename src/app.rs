@@ -1,18 +1,15 @@
-use cgmath::{EuclideanSpace, Point3, SquareMatrix};
-// app.rs
+// src/app.rs
+use cgmath::{Point3, SquareMatrix};
 use hecs::World;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::dpi::Size;
-use winit::event::Event;
 use winit::event::MouseScrollDelta::*;
 use winit::event::WindowEvent;
 use winit::event::{DeviceEvent, DeviceId};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::Key;
-use winit::keyboard::NamedKey;
 use winit::keyboard::PhysicalKey;
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::input::Input;
@@ -33,45 +30,30 @@ impl<'window> ApplicationHandler for App<'window> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let win_attr = Window::default_attributes()
-                .with_title("Voxel Renderer")
-                .with_inner_size(winit::dpi::PhysicalSize::new(800, 800))
-                .with_min_inner_size(winit::dpi::PhysicalSize::new(200, 200));
+                .with_title("Neural Chassis")
+                .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
             let window = Arc::new(event_loop.create_window(win_attr).unwrap());
-            self.window = Some(window.clone());
-            self.wgpu_ctx = Some(WgpuCtx::new(window.clone()));
 
-            // Initialize ECS world
+            // Async creation wrapper
+            let wgpu_ctx = pollster::block_on(WgpuCtx::new_async(window.clone()));
+
+            self.window = Some(window.clone());
+            self.wgpu_ctx = Some(wgpu_ctx);
             self.world = World::new();
 
-            // Get window size for initial aspect ratio
-            let window_size = if let Some(window) = &self.window {
-                let size = window.inner_size();
-                Some((size.width, size.height))
-            } else {
-                None
-            };
-
-            // Setup camera with correct aspect ratio
-            self.camera_entity = Some(crate::world::setup_camera_entity(
+            // Setup Camera
+            let window_size = window.inner_size();
+            self.camera_entity = Some(setup_camera_entity(
                 &mut self.world,
-                window_size,
+                Some((window_size.width, window_size.height)),
             ));
 
-            // if let Some(wgpu_ctx) = &mut self.wgpu_ctx {
-            //     // Load a model
-            //     if let Some(model_index) = wgpu_ctx.load_model("./assets/models/suzanne.gltf") {
-            //         // Spawn a model entity
-            //         crate::world::spawn_model_entity(
-            //             &mut self.world,
-            //             model_index,
-            //             Point3::new(2.0, 0.0, 0.0), // Position to the right
-            //         );
-            //     }
-            // }
-        }
-
-        if let Some(window) = &self.window {
-            window.request_redraw();
+            // Adjust camera start position to see the brain center
+            if let Some(e) = self.camera_entity {
+                if let Ok(t) = self.world.query_one_mut::<&mut Transform>(e) {
+                    t.position = Point3::new(0.0, 0.0, -12.0); // Look at 0,0,0
+                }
+            }
         }
     }
 
@@ -83,37 +65,13 @@ impl<'window> ApplicationHandler for App<'window> {
     ) {
         match event.clone() {
             WindowEvent::CloseRequested => event_loop.exit(),
-            // In app.rs, update the window_event handler for WindowEvent::Resized
             WindowEvent::Resized(new_size) => {
-                if let (Some(wgpu_ctx), Some(window)) =
-                    (self.wgpu_ctx.as_mut(), self.window.as_ref())
-                {
+                if let (Some(wgpu_ctx), Some(_)) = (self.wgpu_ctx.as_mut(), self.window.as_ref()) {
                     wgpu_ctx.resize((new_size.width, new_size.height));
-
-                    // Update camera aspect ratio
-                    if let Some(camera_entity) = self.camera_entity {
-                        if let Ok(camera) = self.world.query_one_mut::<&mut Camera>(camera_entity) {
+                    if let Some(entity) = self.camera_entity {
+                        if let Ok(camera) = self.world.query_one_mut::<&mut Camera>(entity) {
                             camera.aspect = new_size.width as f32 / new_size.height as f32;
                         }
-                    }
-
-                    window.request_redraw();
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-                let io = imgui.context.io();
-
-                // Only process keyboard input if ImGui isn't capturing it
-                if !io.want_capture_keyboard {
-                    if let Key::Named(NamedKey::Escape) = event.logical_key {
-                        if event.state.is_pressed() {
-                            event_loop.exit();
-                        }
-                    }
-
-                    if let PhysicalKey::Code(key) = event.physical_key {
-                        self.input_system.handle_key_input(key, event.state);
                     }
                 }
             }
@@ -125,29 +83,18 @@ impl<'window> ApplicationHandler for App<'window> {
                     .unwrap_or_default();
                 self.last_frame_time = Some(now);
 
-                // Update camera system
                 update_camera_system(&mut self.world, &self.input_system, dt);
 
-                if let (Some(wgpu_ctx), Some(camera_entity)) =
-                    (&mut self.wgpu_ctx, self.camera_entity)
-                {
-                    if let Ok((transform, camera)) = self
-                        .world
-                        .query_one_mut::<(&Transform, &Camera)>(camera_entity)
-                    {
-                        let view_proj = calculate_view_projection(transform, camera);
-                        let inv_view_proj = view_proj.invert().unwrap();
-                        let view = calculate_view_matrix(transform);
-                        wgpu_ctx.update_camera_uniform(
-                            view_proj,
-                            inv_view_proj,
-                            view,
-                            transform.position.into(),
-                        );
+                // Update Camera Uniforms
+                if let (Some(wgpu_ctx), Some(entity)) = (&mut self.wgpu_ctx, self.camera_entity) {
+                    if let Ok((t, c)) = self.world.query_one_mut::<(&Transform, &Camera)>(entity) {
+                        let view_proj = calculate_view_projection(t, c);
+                        let inv = view_proj.invert().unwrap();
+                        let view = calculate_view_matrix(t);
+                        wgpu_ctx.update_camera_uniform(view_proj, inv, view, t.position.into());
                     }
-                }
 
-                if let Some(wgpu_ctx) = &mut self.wgpu_ctx {
+                    // DRAW
                     wgpu_ctx.draw(
                         &mut self.world,
                         self.window.as_mut().unwrap(),
@@ -156,79 +103,71 @@ impl<'window> ApplicationHandler for App<'window> {
                 }
 
                 self.input_system.update();
+                self.window.as_ref().unwrap().request_redraw(); // Continuous loop
+            }
+            // Input Handling (Pass to ImGui + Input System)
+            WindowEvent::KeyboardInput { event, .. } => {
+                let io = self.wgpu_ctx.as_mut().unwrap().imgui.context.io();
+                if !io.want_capture_keyboard {
+                    if let Key::Named(NamedKey::Escape) = event.logical_key {
+                        event_loop.exit();
+                    }
+                    if let PhysicalKey::Code(key) = event.physical_key {
+                        self.input_system.handle_key_input(key, event.state);
+                    }
+                }
             }
             WindowEvent::MouseInput { button, state, .. } => {
-                let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-                let io = imgui.context.io();
-
-                if !io.want_capture_mouse {
+                if !self
+                    .wgpu_ctx
+                    .as_mut()
+                    .unwrap()
+                    .imgui
+                    .context
+                    .io()
+                    .want_capture_mouse
+                {
                     self.input_system.handle_mouse_button(button, state);
                 }
             }
-
             WindowEvent::CursorMoved { position, .. } => {
-                let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-                let io = imgui.context.io();
-
-                if !io.want_capture_mouse {
-                    self.input_system.handle_cursor_moved(&position);
-                }
+                self.input_system.handle_cursor_moved(&position);
             }
             WindowEvent::MouseWheel { delta, .. } => match delta {
-                LineDelta(_, y) => {
-                    self.input_system.handle_mouse_scroll(y as f64);
-                }
-                PixelDelta(d) => {
-                    self.input_system.handle_mouse_scroll(d.y);
-                }
+                LineDelta(_, y) => self.input_system.handle_mouse_scroll(y as f64),
+                PixelDelta(d) => self.input_system.handle_mouse_scroll(d.y),
             },
             _ => (),
         }
 
-        let window = self.window.as_mut().unwrap();
-        let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-        imgui.platform.handle_event::<()>(
-            imgui.context.io_mut(),
-            &window,
-            &Event::WindowEvent { window_id, event },
-        );
-    }
-
-    fn device_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        device_id: DeviceId,
-        event: DeviceEvent,
-    ) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            self.input_system.handle_mouse_motion((delta.0, delta.1));
+        // Pass to ImGui
+        if let Some(ctx) = self.wgpu_ctx.as_mut() {
+            ctx.imgui.platform.handle_event::<()>(
+                ctx.imgui.context.io_mut(),
+                self.window.as_ref().unwrap(),
+                &winit::event::Event::WindowEvent { window_id, event },
+            );
         }
-
-        let window = self.window.as_mut().unwrap();
-        let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-        imgui.platform.handle_event::<()>(
-            imgui.context.io_mut(),
-            &window,
-            &Event::DeviceEvent { device_id, event },
-        );
     }
+}
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ()) {
-        let window = self.window.as_mut().unwrap();
-        let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-        imgui.platform.handle_event::<()>(
-            imgui.context.io_mut(),
-            &window,
-            &Event::UserEvent(event),
-        );
-    }
+pub fn setup_camera_entity(world: &mut World, window_size: Option<(u32, u32)>) -> hecs::Entity {
+    // Calculate initial aspect ratio based on window size, or use default if not provided
+    let aspect = if let Some((width, height)) = window_size {
+        width as f32 / height as f32
+    } else {
+        16.0 / 9.0 // Default aspect ratio
+    };
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let window = self.window.as_mut().unwrap();
-        let imgui = &mut self.wgpu_ctx.as_mut().unwrap().imgui;
-        window.request_redraw();
-        imgui
-            .platform
-            .handle_event::<()>(imgui.context.io_mut(), &window, &Event::AboutToWait);
-    }
+    world.spawn((
+        Transform {
+            position: Point3::new(0.0, 1.0, 3.0),
+            ..Default::default()
+        },
+        Camera {
+            aspect,
+            ..Default::default()
+        },
+        CameraController::default(),
+    ))
 }
