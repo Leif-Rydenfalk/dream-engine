@@ -19,15 +19,15 @@ pub struct Mesh {
 pub struct Material {
     pub name: String,
     pub diffuse_texture: crate::img_utils::RgbaImg,
-    pub texture: Option<wgpu::Texture>, // Store the texture
-    pub texture_view: Option<wgpu::TextureView>, // Store the view
+    pub texture: Option<wgpu::Texture>,
+    pub texture_view: Option<wgpu::TextureView>,
     pub bind_group: Option<wgpu::BindGroup>,
 }
 
 impl Model {
     pub fn load<P: AsRef<Path>>(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         path: P,
     ) -> Option<Self> {
         let path = path.as_ref();
@@ -42,32 +42,11 @@ impl Model {
         let mut meshes = Vec::new();
         let mut materials = Vec::new();
 
-        // Process materials first
+        // Process materials
         for material in gltf.materials() {
             let name = material.name().unwrap_or("unnamed material").to_string();
 
             // Get the base color texture
-            let diffuse_texture =
-                if let Some(pbr) = material.pbr_metallic_roughness().base_color_texture() {
-                    let texture = pbr.texture();
-                    let source = texture.source().source();
-
-                    match source {
-                        gltf::image::Source::Uri { uri, .. } => {
-                            let texture_path = path.parent().unwrap().join(uri);
-                            crate::img_utils::RgbaImg::new(texture_path.to_str().unwrap())
-                        }
-                        _ => {
-                            // Fall back to default texture for embedded or unsupported sources
-                            crate::img_utils::RgbaImg::new("./assets/images/example-img.png")
-                        }
-                    }
-                } else {
-                    // Fall back to default texture
-                    crate::img_utils::RgbaImg::new("./assets/images/example-img.png")
-                };
-
-            // Inside the Material handling code
             let diffuse_texture = if let Some(pbr) =
                 material.pbr_metallic_roughness().base_color_texture()
             {
@@ -85,17 +64,12 @@ impl Model {
                             }
                         }
                     }
-                    _ => {
-                        // Fall back to default texture for embedded or unsupported sources
-                        crate::img_utils::RgbaImg::new("./assets/images/example-img.png")
-                    }
+                    _ => crate::img_utils::RgbaImg::new("./assets/images/example-img.png"),
                 }
             } else {
-                // Fall back to default texture
                 crate::img_utils::RgbaImg::new("./assets/images/example-img.png")
             };
 
-            // Only create a material if the texture exists
             if let Some(texture) = diffuse_texture {
                 materials.push(Material {
                     name,
@@ -104,8 +78,6 @@ impl Model {
                     texture: None,
                     texture_view: None,
                 });
-            } else {
-                eprintln!("Couldn't load any texture for material {}, skipping", name);
             }
         }
 
@@ -114,35 +86,30 @@ impl Model {
             let name = mesh.name().unwrap_or("unnamed mesh").to_string();
 
             for primitive in mesh.primitives() {
-                // Get the material for this primitive
                 let material_index = primitive.material().index();
-
-                // Access vertex position attribute
                 let reader = primitive.reader(|buffer| {
                     let buffer_data = gltf.blob.as_ref().unwrap();
                     Some(&buffer_data[..])
                 });
 
-                // Extract positions, normals, and texture coordinates
                 let positions = if let Some(iter) = reader.read_positions() {
                     iter.collect::<Vec<_>>()
                 } else {
-                    continue; // Skip if no positions
+                    continue;
                 };
 
                 let normals = if let Some(iter) = reader.read_normals() {
                     iter.collect::<Vec<_>>()
                 } else {
-                    vec![[0.0, 1.0, 0.0]; positions.len()] // Use up vector as default
+                    vec![[0.0, 1.0, 0.0]; positions.len()]
                 };
 
                 let tex_coords = if let Some(iter) = reader.read_tex_coords(0) {
                     iter.into_f32().collect::<Vec<_>>()
                 } else {
-                    vec![[0.0, 0.0]; positions.len()] // Use default UV
+                    vec![[0.0, 0.0]; positions.len()]
                 };
 
-                // Combine data into our Vertex format
                 let vertices: Vec<Vertex> = positions
                     .into_iter()
                     .zip(tex_coords.into_iter())
@@ -154,15 +121,12 @@ impl Model {
                     })
                     .collect();
 
-                // Get indices
                 let indices = if let Some(indices) = reader.read_indices() {
                     indices.into_u32().collect::<Vec<_>>()
                 } else {
-                    // If no indices, create sequential indices
                     (0..vertices.len() as u32).collect()
                 };
 
-                // Create buffers
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&format!("{} Vertex Buffer", name)),
                     contents: bytemuck::cast_slice(&vertices),
@@ -188,7 +152,6 @@ impl Model {
         Some(Model { meshes, materials })
     }
 
-    // Create bind groups for all materials
     pub fn create_bind_groups(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) {
         for material in &mut self.materials {
             let texture_size = wgpu::Extent3d {
@@ -211,12 +174,8 @@ impl Model {
             let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                address_mode_u: wgpu::AddressMode::Repeat,
-                address_mode_v: wgpu::AddressMode::Repeat,
-                address_mode_w: wgpu::AddressMode::Repeat,
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
 
@@ -240,7 +199,6 @@ impl Model {
         }
     }
 
-    // Upload all textures to the GPU
     pub fn upload_textures(&self, queue: &wgpu::Queue) {
         for material in &self.materials {
             if let (Some(texture), Some(_)) = (&material.texture, &material.bind_group) {

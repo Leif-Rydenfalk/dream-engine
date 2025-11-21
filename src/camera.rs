@@ -1,11 +1,9 @@
-// src/camera.rs
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
 pub struct CameraFeed {
-    // Shared buffer between async grabber and main thread
     pub current_frame: Arc<Mutex<Option<image::RgbaImage>>>,
 }
 
@@ -17,16 +15,15 @@ impl CameraFeed {
         thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async move {
-                let client = reqwest::Client::new();
+                // Add a timeout so it doesn't hang if IP is wrong
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_millis(1000))
+                    .build()
+                    .unwrap_or_default();
 
-                println!("Connecting to camera: {}", url);
+                println!("Attempting to connect to camera: {}", url);
 
                 loop {
-                    // Reconnect loop
-                    // Simple approach: Repeatedly fetch the latest snapshot (snapshot.jpg)
-                    // This is often easier than parsing multipart MJPEG streams manually in rust
-                    // Most IP webcams expose /shot.jpg or /photo.jpg
-
                     match client.get(&url).send().await {
                         Ok(resp) => {
                             if let Ok(bytes) = resp.bytes().await {
@@ -36,13 +33,13 @@ impl CameraFeed {
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Camera error: {}", e);
+                        Err(_) => {
+                            // Suppress spamming error logs, just wait
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
 
-                    // Cap at ~30 FPS polling
+                    // ~30 FPS polling
                     tokio::time::sleep(Duration::from_millis(33)).await;
                 }
             });
@@ -53,6 +50,6 @@ impl CameraFeed {
 
     pub fn get_frame(&self) -> Option<image::RgbaImage> {
         let mut lock = self.current_frame.lock().unwrap();
-        lock.take() // Take puts None, so we consume the frame (good for only updating on new data)
+        lock.take()
     }
 }

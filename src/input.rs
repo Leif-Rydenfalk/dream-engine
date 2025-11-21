@@ -1,4 +1,3 @@
-// input_system.rs
 use std::collections::HashMap;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton};
@@ -54,32 +53,13 @@ impl Input {
             && self.keys_previous.get(&key) != Some(&ElementState::Pressed)
     }
 
-    pub fn is_key_released(&self, key: KeyCode) -> bool {
-        self.keys_current.get(&key) == Some(&ElementState::Released)
-            && self.keys_previous.get(&key) == Some(&ElementState::Pressed)
-    }
-
     pub fn is_key_down(&self, key: KeyCode) -> bool {
         self.keys_current.get(&key) == Some(&ElementState::Pressed)
     }
 
     // Mouse state queries
-    pub fn is_mouse_button_pressed(&self, button: MouseButton) -> bool {
-        self.mouse_buttons_current.get(&button) == Some(&ElementState::Pressed)
-            && self.mouse_buttons_previous.get(&button) != Some(&ElementState::Pressed)
-    }
-
-    pub fn is_mouse_button_released(&self, button: MouseButton) -> bool {
-        self.mouse_buttons_current.get(&button) == Some(&ElementState::Released)
-            && self.mouse_buttons_previous.get(&button) == Some(&ElementState::Pressed)
-    }
-
     pub fn is_mouse_button_down(&self, button: MouseButton) -> bool {
         self.mouse_buttons_current.get(&button) == Some(&ElementState::Pressed)
-    }
-
-    pub fn mouse_position(&self) -> (f64, f64) {
-        self.mouse_position
     }
 
     pub fn mouse_delta(&self) -> (f64, f64) {

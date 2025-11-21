@@ -13,7 +13,6 @@ use std::time::{Instant, SystemTime};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-// --- ShaderHotReload Definition ---
 pub struct ShaderHotReload {
     device: Arc<wgpu::Device>,
     shader_dir: PathBuf,
@@ -43,7 +42,6 @@ impl ShaderHotReload {
     }
 }
 
-// --- CameraUniform Definition ---
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
@@ -76,20 +74,15 @@ pub struct WgpuCtx<'window> {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
 
-    // Infrastructure
     shader_hot_reload: Arc<ShaderHotReload>,
 
-    // Camera
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
 
-    // Rendering Targets
     depth_texture_view: wgpu::TextureView,
 
-    // THE BRAIN
     pub brain_system: BrainSystem,
 
-    // ImGui / UI
     pub imgui: ImguiState,
     input_texture_id: Option<TextureId>,
     output_texture_id: Option<TextureId>,
@@ -99,7 +92,6 @@ pub struct WgpuCtx<'window> {
 
 impl<'window> WgpuCtx<'window> {
     pub async fn new_async(window: Arc<Window>) -> Self {
-        // 1. WGPU Init
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
         let adapter = instance
@@ -119,6 +111,7 @@ impl<'window> WgpuCtx<'window> {
                         | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
                     required_limits: wgpu::Limits {
                         max_compute_invocations_per_workgroup: 512,
+                        max_storage_buffer_binding_size: 512 * 1024 * 1024,
                         ..wgpu::Limits::default()
                     },
                     ..Default::default()
@@ -137,13 +130,12 @@ impl<'window> WgpuCtx<'window> {
         surface_config.present_mode = wgpu::PresentMode::AutoNoVsync;
         surface.configure(&device, &surface_config);
 
-        // 2. Utils
         let shader_hot_reload = Arc::new(ShaderHotReload::new(
             Arc::clone(&device),
             std::path::Path::new("src/shaders"),
         ));
 
-        // 3. Camera Uniforms
+        // Camera Uniforms
         let camera_uniform = CameraUniform::default();
         let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -177,7 +169,7 @@ impl<'window> WgpuCtx<'window> {
             }],
         });
 
-        // 4. Depth Texture
+        // Depth Texture
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth"),
             size: wgpu::Extent3d {
@@ -194,7 +186,9 @@ impl<'window> WgpuCtx<'window> {
         });
         let depth_texture_view = depth_texture.create_view(&Default::default());
 
-        // 5. Initialize The Brain
+        // Initialize Brain
+        // Note: Change this URL to a valid stream or image if needed.
+        // Logic handles timeouts gracefully now.
         let camera_url = "http://192.168.50.208:8080/shot.jpg".to_string();
 
         let brain_system = BrainSystem::new(
@@ -203,13 +197,13 @@ impl<'window> WgpuCtx<'window> {
             &camera_bind_group_layout,
             &shader_hot_reload,
             camera_url,
-            surface_config.format, // <--- FIX: Passing the format
+            surface_config.format,
         );
 
-        // 6. Init ImGui
+        // Init ImGui
         let mut imgui = Self::init_imgui(&device, &queue, &window, surface_config.format);
 
-        // Register Brain Textures with ImGui Renderer using from_raw_parts
+        // Register Brain Textures with ImGui
         let (in_tex, in_view, out_tex, out_view) = brain_system.get_textures();
         let brain_tex_size = wgpu::Extent3d {
             width: 512,
@@ -217,7 +211,6 @@ impl<'window> WgpuCtx<'window> {
             depth_or_array_layers: 1,
         };
 
-        // Config for sampler creation inside from_raw_parts
         let raw_config = imgui_wgpu::RawTextureConfig {
             label: Some("Brain Sampler"),
             sampler_desc: wgpu::SamplerDescriptor {
@@ -272,39 +265,14 @@ impl<'window> WgpuCtx<'window> {
     }
 
     pub fn draw(&mut self, _world: &mut World, window: &Window, input: &Input) {
-        // 1. Update CPU State
         let window_size = (self.surface_config.width, self.surface_config.height);
         self.brain_system.update(input, window_size);
 
-        // 2. Prepare Render Pass
         let surface_texture = self.surface.get_current_texture().unwrap();
         let view = surface_texture.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        // 3. Render The Brain (Compute + 3D Draw)
-        {
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-        }
-
+        // Render The Brain
         self.brain_system.render(
             &mut encoder,
             &self.camera_bind_group,
@@ -312,7 +280,7 @@ impl<'window> WgpuCtx<'window> {
             &view,
         );
 
-        // 4. Render UI (Camera Feed & Hallucinations)
+        // Render UI
         self.render_imgui(&mut encoder, &view, window);
 
         self.queue.submit(Some(encoder.finish()));
@@ -335,86 +303,93 @@ impl<'window> WgpuCtx<'window> {
         {
             let ui = self.imgui.context.frame();
 
-            // --- DASHBOARD WINDOW ---
-      
-            ui.window("Neural Interlink")
+            ui.window("Hybrid Neural Chassis")
                 .position([10.0, 10.0], Condition::FirstUseEver)
                 .size([400.0, 600.0], Condition::FirstUseEver)
                 .build(|| {
                     ui.text(format!("FPS: {:.1}", ui.io().framerate));
                     ui.separator();
 
-                    // --- MODE CONTROL ---
                     let mode_text = if self.brain_system.params.train_mode == 1 {
-                        "Mode: TRAINING (Input On)"
+                        "Mode: LEARNING (Active)"
                     } else {
-                        "Mode: DREAMING (Input Off)"
+                        "Mode: DREAMING (Inference)"
                     };
                     ui.text(mode_text);
-                    if ui.button("Toggle Dream Mode (Space)") {
-                        self.brain_system.params.train_mode = if self.brain_system.params.train_mode == 1 { 0 } else { 1 };
+                    if ui.button("Toggle Mode (Space)") {
+                        self.brain_system.params.train_mode =
+                            if self.brain_system.params.train_mode == 1 {
+                                0
+                            } else {
+                                1
+                            };
                     }
                     ui.separator();
 
-                    // --- BRAIN TUNING ---
-                    ui.text("Synaptic Tuning");
-                    
-                    // Connectivity (Samples)
-                    // CAUTION: High values reduce FPS
-                    let mut samples = self.brain_system.params.sample_count as i32;
-                    if ui.slider("Connectivity", 1, 32, &mut samples) {
-                        self.brain_system.params.sample_count = samples as u32;
-                    }
-                    if ui.is_item_hovered() {
-                        ui.tooltip_text("How many neighbors each neuron checks per frame.\nHigher = Smarter but Slower.");
+                    ui.text("Geometric Connectivity");
+                    let mut samples = self.brain_system.params.geometric_sample_count as i32;
+                    if ui.slider("Sample Count", 32, 256, &mut samples) {
+                        self.brain_system.params.geometric_sample_count = samples as u32;
                     }
 
-                    // Mix Rate (Stubbornness)
-                    ui.slider("Reality Mix Rate", 0.001, 0.5, &mut self.brain_system.params.mix_rate);
-                    if ui.is_item_hovered() {
-                        ui.tooltip_text("Lower = Deep temporal integration (Ghosts).\nHigher = Instant reaction (Twitchy).");
-                    }
-
-                    // Dream Decay (Memory)
-                    ui.slider("Memory Decay", 0.5, 0.999, &mut self.brain_system.params.dream_decay);
-                    if ui.is_item_hovered() {
-                        ui.tooltip_text("How much energy is retained per frame.\n0.99 = Long Echoes.");
-                    }
+                    ui.slider(
+                        "Inhibit Radius",
+                        0.0,
+                        1.0,
+                        &mut self.brain_system.kernel.inhibit_radius,
+                    );
+                    ui.slider(
+                        "Inhibit Strength",
+                        0.0,
+                        2.0,
+                        &mut self.brain_system.kernel.inhibit_strength,
+                    );
 
                     ui.separator();
-                    ui.text("Neuroplasticity");
+                    ui.text("Explicit Synapses");
+                    ui.slider(
+                        "Learning Rate",
+                        0.0,
+                        0.5,
+                        &mut self.brain_system.kernel.explicit_learning_rate,
+                    );
+                    ui.slider(
+                        "Pruning Threshold",
+                        1.0,
+                        20.0,
+                        &mut self.brain_system.kernel.pruning_threshold,
+                    );
 
-                    // Learning Rate
-                    ui.slider("Learning Rate", 0.0, 0.2, &mut self.brain_system.params.learning_rate);
-                    
-                    // Terror Threshold
-                    ui.slider("Panic Threshold", 0.01, 1.0, &mut self.brain_system.params.terror_threshold);
-                    if ui.is_item_hovered() {
-                        ui.tooltip_text("Error level required to trigger structural changes (movement).");
-                    }
-                    
                     ui.separator();
+                    ui.text("Terror Dynamics");
+                    ui.slider(
+                        "Terror Threshold",
+                        0.01,
+                        1.0,
+                        &mut self.brain_system.params.terror_threshold,
+                    );
+                    ui.slider(
+                        "Temporal Decay",
+                        0.01,
+                        0.5,
+                        &mut self.brain_system.kernel.temporal_decay,
+                    );
 
+                    ui.separator();
 
                     if let (Some(in_id), Some(out_id)) =
                         (self.input_texture_id, self.output_texture_id)
                     {
                         ui.columns(2, "cam_cols", true);
-                        ui.text("Optic Nerve (Input)");
-                        Image::new(in_id, [256.0, 256.0]).build(ui);
+                        ui.text("Retina");
+                        Image::new(in_id, [128.0, 128.0]).build(ui);
                         ui.next_column();
-                        ui.text("Visual Cortex (Activity)");
-                        Image::new(out_id, [256.0, 256.0]).build(ui);
+                        ui.text("Cortex");
+                        Image::new(out_id, [128.0, 128.0]).build(ui);
                         ui.columns(1, "reset", false);
                     }
-
-                    ui.separator();
-                    ui.text("Controls:");
-                    ui.text("- Mouse Wheel: Zoom");
-                    ui.text("- W/A/S/D: Move Camera");
                 });
 
-            // Prepare the platform (handles cursor, etc.)
             self.imgui.platform.prepare_render(&ui, window);
         }
 
@@ -437,7 +412,8 @@ impl<'window> WgpuCtx<'window> {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    ..Default::default()
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
                 }),
             )
             .expect("Imgui Render Error");

@@ -4,7 +4,6 @@ use imgui::*;
 use imgui_wgpu::Renderer;
 use imgui_winit_support::WinitPlatform;
 
-// --- ImguiState Struct (Unchanged) ---
 pub struct ImguiState {
     pub context: imgui::Context,
     pub platform: WinitPlatform,
