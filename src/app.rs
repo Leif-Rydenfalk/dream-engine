@@ -1,3 +1,5 @@
+// src/app.rs
+
 use cgmath::{Point3, SquareMatrix};
 use hecs::World;
 use std::sync::Arc;
@@ -8,13 +10,13 @@ use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::PhysicalKey;
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId}; // Added CursorGrabMode
 
 use crate::input::Input;
 use crate::wgpu_ctx::WgpuCtx;
 use crate::*;
 
-#[derive(Default)]
+// 1. Add camera_active state
 pub struct App<'window> {
     window: Option<Arc<Window>>,
     wgpu_ctx: Option<WgpuCtx<'window>>,
@@ -22,6 +24,21 @@ pub struct App<'window> {
     world: World,
     camera_entity: Option<hecs::Entity>,
     last_frame_time: Option<Instant>,
+    camera_active: bool, // New field
+}
+
+impl<'window> Default for App<'window> {
+    fn default() -> Self {
+        Self {
+            window: None,
+            wgpu_ctx: None,
+            input_system: Input::default(),
+            world: World::new(),
+            camera_entity: None,
+            last_frame_time: None,
+            camera_active: true, // Default to camera control on
+        }
+    }
 }
 
 impl<'window> ApplicationHandler for App<'window> {
@@ -32,7 +49,10 @@ impl<'window> ApplicationHandler for App<'window> {
                 .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
             let window = Arc::new(event_loop.create_window(win_attr).unwrap());
 
-            // Block on async creation
+            // Initialize Cursor State (Locked/Hidden)
+            let _ = window.set_cursor_grab(CursorGrabMode::Locked);
+            window.set_cursor_visible(false);
+
             let wgpu_ctx = pollster::block_on(WgpuCtx::new_async(window.clone()));
 
             self.window = Some(window.clone());
@@ -45,16 +65,14 @@ impl<'window> ApplicationHandler for App<'window> {
                 Some((window_size.width, window_size.height)),
             ));
 
-            // Initial camera position adjustment
             if let Some(e) = self.camera_entity {
                 if let Ok(t) = self.world.query_one_mut::<&mut Transform>(e) {
-                    t.position = Point3::new(0.0, 0.0, 25.0); // Move back to see the cloud
+                    t.position = Point3::new(0.0, 0.0, 25.0);
                 }
             }
         }
     }
 
-    // Handle raw hardware mouse motion for camera look
     fn device_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
@@ -62,14 +80,8 @@ impl<'window> ApplicationHandler for App<'window> {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            // Check if ImGui wants the mouse first
-            let want_capture = self
-                .wgpu_ctx
-                .as_ref()
-                .map(|ctx| ctx.imgui.context.io().want_capture_mouse)
-                .unwrap_or(false);
-
-            if !want_capture {
+            // 2. Only process raw mouse motion if camera is active
+            if self.camera_active {
                 self.input_system.handle_mouse_motion(delta);
             }
         }
@@ -81,7 +93,6 @@ impl<'window> ApplicationHandler for App<'window> {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Pass events to ImGui
         if let Some(ctx) = self.wgpu_ctx.as_mut() {
             ctx.imgui.platform.handle_event::<()>(
                 ctx.imgui.context.io_mut(),
@@ -113,19 +124,17 @@ impl<'window> ApplicationHandler for App<'window> {
                     .unwrap_or_default();
                 self.last_frame_time = Some(now);
 
-                update_camera_system(&mut self.world, &self.input_system, dt);
+                // 3. Pass camera_active state to the update system
+                update_camera_system(&mut self.world, &self.input_system, dt, self.camera_active);
 
                 if let (Some(wgpu_ctx), Some(entity)) = (&mut self.wgpu_ctx, self.camera_entity) {
-                    // 1. Calculate Camera Matrices
                     if let Ok((t, c)) = self.world.query_one_mut::<(&Transform, &Camera)>(entity) {
                         let view_proj = calculate_view_projection(t, c);
                         let inv = view_proj.invert().unwrap();
                         let view = calculate_view_matrix(t);
-                        // 2. Upload to GPU
                         wgpu_ctx.update_camera_uniform(view_proj, inv, view, t.position.into());
                     }
 
-                    // 3. Draw
                     wgpu_ctx.draw(
                         &mut self.world,
                         self.window.as_mut().unwrap(),
@@ -133,12 +142,32 @@ impl<'window> ApplicationHandler for App<'window> {
                     );
                 }
 
-                // Reset per-frame input states
                 self.input_system.update();
                 self.window.as_ref().unwrap().request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let io = self.wgpu_ctx.as_mut().unwrap().imgui.context.io();
+
+                // 4. Handle Tab Key Toggle
+                if event.state.is_pressed() && event.logical_key == Key::Named(NamedKey::Tab) {
+                    self.camera_active = !self.camera_active;
+
+                    if let Some(window) = &self.window {
+                        if self.camera_active {
+                            // Lock and Hide cursor for 3D control
+                            let _ = window
+                                .set_cursor_grab(CursorGrabMode::Locked)
+                                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                            window.set_cursor_visible(false);
+                        } else {
+                            // Release and Show cursor for ImGui
+                            let _ = window.set_cursor_grab(CursorGrabMode::None);
+                            window.set_cursor_visible(true);
+                        }
+                    }
+                }
+
+                // Standard input handling
                 if !io.want_capture_keyboard {
                     if let Key::Named(NamedKey::Escape) = event.logical_key {
                         event_loop.exit();

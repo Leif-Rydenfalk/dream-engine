@@ -63,10 +63,16 @@ impl Default for CameraController {
     }
 }
 
-pub fn update_camera_system(world: &mut World, input: &Input, dt: Duration) {
+// 1. Accept `is_active: bool` in arguments
+pub fn update_camera_system(world: &mut World, input: &Input, dt: Duration, is_active: bool) {
     for (_, (transform, _camera, controller)) in
         world.query_mut::<(&mut Transform, &Camera, &mut CameraController)>()
     {
+        // 2. Gate the logic
+        if !is_active {
+            continue;
+        }
+
         let dt = dt.as_secs_f32();
 
         if input.scroll_delta() != 0.0 {
@@ -104,6 +110,14 @@ pub fn update_camera_system(world: &mut World, input: &Input, dt: Duration) {
         }
         if input.is_key_down(winit::keyboard::KeyCode::KeyD) {
             movement_input += right;
+        }
+
+        // Vertical movement (Q/E) - Optional but useful
+        if input.is_key_down(winit::keyboard::KeyCode::KeyE) {
+            movement_input += Vector3::unit_y();
+        }
+        if input.is_key_down(winit::keyboard::KeyCode::KeyQ) {
+            movement_input -= Vector3::unit_y();
         }
 
         if movement_input != Vector3::zero() {
