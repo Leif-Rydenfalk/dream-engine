@@ -147,16 +147,34 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(64)
 fn cs_clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
-    if (idx >= arrayLength(&spatial_grid)) { return; }
-    atomicStore(&spatial_grid[idx], 0xFFFFFFFFu);
+    // The array is now 8x larger, so we must ensure we cover it all.
+    // Note: Dispatch size in Rust is based on GRID*GRID.
+    // We need to clear GRID*GRID*8.
+    // Quick hack: Loop inside the shader or just trust the buffer size check?
+    // Better: In Rust, increase dispatch size x8 OR loop here.
+    // Let's Loop here to avoid changing Rust dispatch logic too much.
+    
+    let layer_stride = params.grid_dim * params.grid_dim;
+    if (idx >= layer_stride) { return; }
+
+    for (var i = 0u; i < 8u; i++) {
+        atomicStore(&spatial_grid[idx + i * layer_stride], 0xFFFFFFFFu);
+    }
 }
 
 @compute @workgroup_size(64)
 fn cs_populate_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= params.neuron_count) { return; }
-    let grid_idx = hash_to_grid(neurons[idx].pos);
-    atomicStore(&spatial_grid[grid_idx], idx);
+    
+    let n = neurons[idx];
+    let layer_stride = params.grid_dim * params.grid_dim;
+    
+    // Offset by neuron layer. Safety clamp to 7.
+    let layer_offset = clamp(n.layer, 0u, 7u) * layer_stride;
+    let grid_idx = hash_to_grid(n.pos);
+    
+    atomicStore(&spatial_grid[grid_idx + layer_offset], idx);
 }
 
 @compute @workgroup_size(64)
@@ -199,8 +217,10 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     // Chain: L0 -> L1 -> L2 -> L3 -> L4 -> L5 -> L6
     // L1-L3: Encoder (Abstracting Error)
     // L4-L6: Decoder (Reconstructing Prediction)
-    
+
     let source_layer = n.layer - 1u;
+    let layer_stride = params.grid_dim * params.grid_dim;
+    let source_grid_offset = source_layer * layer_stride;
     
     var accum = 0.0;
     var weight_sum = 0.0;
@@ -217,8 +237,7 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var dx = -rf_rad; dx <= rf_rad; dx++) {
             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-            let g_idx = gx + gy * params.grid_dim;
-            
+            let g_idx = gx + gy * params.grid_dim + source_grid_offset; 
             let src_idx = atomicLoad(&spatial_grid[g_idx]);
             if (src_idx != 0xFFFFFFFFu) {
                 let src = neurons[src_idx];
@@ -287,6 +306,9 @@ fn cs_generate_lines(@builtin(global_invocation_id) id: vec3<u32>) {
     
     if (n.layer == 0u) { return; }
     let source_layer = n.layer - 1u;
+    let layer_stride = params.grid_dim * params.grid_dim;
+    let source_grid_offset = source_layer * layer_stride;
+
     
     var best_idx = 0xFFFFFFFFu;
     var best_dist = 100.0;
@@ -300,7 +322,8 @@ fn cs_generate_lines(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var dx = -1; dx <= 1; dx++) {
              let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
              let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-             let src_idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim]);
+            let g_idx = gx + gy * params.grid_dim + source_grid_offset; 
+             let src_idx = atomicLoad(&spatial_grid[g_idx]);
              
              if (src_idx != 0xFFFFFFFFu) {
                  let src = neurons[src_idx];
@@ -391,10 +414,62 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(8, 8)
-fn cs_clear_cortex(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_render_error(@builtin(global_invocation_id) id: vec3<u32>) {
     let dim = vec2<u32>(512, 512);
     if (id.x >= dim.x || id.y >= dim.y) { return; }
-    textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+    
+    // 1. Calculate position
+    let uv = vec2<f32>(f32(id.x) / 512.0, f32(id.y) / 512.0);
+    let pos = uv * 2.0 - 1.0;
+    
+    // 2. Search for L0 (Retina) neurons near this pixel
+    var error_accum = 0.0;
+    var w_sum = 0.0;
+    
+    let grid_dim = f32(params.grid_dim);
+    let center_u = uv.x * grid_dim;
+    let center_v = uv.y * grid_dim;
+    
+    // Small kernel search to reconstruct the image from neurons
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+             
+             let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim]);
+             
+             if (idx != 0xFFFFFFFFu) {
+                 let n = neurons[idx];
+                 // WE WANT LAYER 0 (Retina/Error Layer)
+                 if (n.layer == 0u) {
+                     let d = distance(pos, n.pos);
+                     // L0 is dense, so we use a tight kernel
+                     let w = exp(-d * 100.0); 
+                     
+                     // Voltage in L0 = (Reality - Prediction)
+                     // We visualize the absolute error
+                     error_accum += n.voltage * w;
+                     w_sum += w;
+                 }
+             }
+        }
+    }
+    
+    let val = select(0.0, error_accum / w_sum, w_sum > 0.0001);
+    
+    // VISUALIZATION:
+    // Red = Positive Error (Reality > Prediction)
+    // Blue = Negative Error (Prediction > Reality)
+    // Black = Perfect Prediction
+    var col = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    
+    if (val > 0.0) {
+        col = vec4<f32>(val * 5.0, 0.0, 0.0, 1.0); // Amplify for visibility
+    } else {
+        col = vec4<f32>(0.0, 0.0, abs(val) * 5.0, 1.0);
+    }
+    
+    textureStore(output_tex, vec2<i32>(id.xy), col);
 }
 
 // --- RENDERING SHADERS ---

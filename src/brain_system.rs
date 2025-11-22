@@ -66,7 +66,7 @@ pub struct BrainSystem {
     populate_grid_pipeline: wgpu::ComputePipeline,
     update_neurons_pipeline: wgpu::ComputePipeline,
     generate_lines_pipeline: wgpu::ComputePipeline,
-    clear_cortex_pipeline: wgpu::ComputePipeline,
+    render_error_pipeline: wgpu::ComputePipeline,
     render_dream_pipeline: wgpu::ComputePipeline,
     render_pipeline_points: wgpu::RenderPipeline,
     render_pipeline_lines: wgpu::RenderPipeline,
@@ -112,7 +112,7 @@ impl BrainSystem {
 
         let spatial_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Spatial Grid"),
-            size: (GRID_DIM as u64 * GRID_DIM as u64 * 4),
+            size: (GRID_DIM as u64 * GRID_DIM as u64 * 4 * 8),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -417,7 +417,7 @@ impl BrainSystem {
         let populate_grid_pipeline = mk_compute("cs_populate_grid");
         let update_neurons_pipeline = mk_compute("cs_update_neurons");
         let generate_lines_pipeline = mk_compute("cs_generate_lines");
-        let clear_cortex_pipeline = mk_compute("cs_clear_cortex");
+        let render_error_pipeline = mk_compute("cs_render_error");
         let render_dream_pipeline = mk_compute("cs_render_dream");
 
         let render_pipeline_layout =
@@ -545,7 +545,7 @@ impl BrainSystem {
             populate_grid_pipeline,
             update_neurons_pipeline,
             generate_lines_pipeline,
-            clear_cortex_pipeline,
+            render_error_pipeline,
             render_dream_pipeline,
             render_pipeline_points,
             render_pipeline_lines,
@@ -561,7 +561,7 @@ impl BrainSystem {
         if input.is_key_pressed(winit::keyboard::KeyCode::Space) {
             self.params.train_mode ^= 1;
         }
-        if input.is_key_pressed(winit::keyboard::KeyCode::KeyD) {
+        if input.is_key_pressed(winit::keyboard::KeyCode::KeyC) {
             self.params.use_camera ^= 1;
         }
 
@@ -624,7 +624,7 @@ impl BrainSystem {
             cpass.set_pipeline(&self.populate_grid_pipeline);
             cpass.dispatch_workgroups((NEURON_COUNT + 63) / 64, 1, 1);
 
-            cpass.set_pipeline(&self.clear_cortex_pipeline);
+            cpass.set_pipeline(&self.render_error_pipeline);
             cpass.dispatch_workgroups(64, 64, 1);
 
             // This writes to prediction texture from L6 neurons
