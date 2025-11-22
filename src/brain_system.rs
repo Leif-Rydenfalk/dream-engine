@@ -15,8 +15,8 @@ pub struct Neuron {
     pub prediction: f32,    // 4 bytes (Memoized state)
     pub precision: f32,     // 4 bytes (Plasticity factor)
     pub layer: u32,         // 4 bytes (0..6)
-    pub _pad0: f32,         // 4 bytes
-    pub _pad1: f32,         // 4 bytes
+    pub fatigue: f32,       // 4 bytes Boost factor
+    pub boredom: f32,       // 4 bytes Padding
 } // Total 48 bytes
 
 #[repr(C)]
