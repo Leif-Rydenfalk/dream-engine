@@ -58,7 +58,8 @@ struct SimParams {
     train_mode: u32, 
     terror_threshold: f32,
     grid_dim: u32,
-    pad: vec4<f32>,
+    use_camera: u32, 
+    pad: vec3<f32>, 
 };
 
 struct LineVertex {
@@ -189,8 +190,34 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     // LAYER 0: RETINA - Compute Prediction Error
     // ========================================
     if (post.layer == 0u) {
-        // Get actual visual input from camera
-        let reality = textureLoad(input_tex, vec2<i32>(post.retinal_coord), 0).r;
+        
+        // 1. Normalize retina coordinate (0..320) to UV space (0..1)
+        var uv = vec2<f32>(post.retinal_coord) / 320.0;
+        
+        var reality = 0.0;
+
+        if (params.use_camera == 1u) {
+            // CAMERA MODE: 
+            // Map UV (0..1) to Texture Size (512) explicitly
+            // We use textureSampleLevel to get smooth interpolation
+            reality = textureSampleLevel(input_tex, input_sampler, uv, 0.0).r;
+        } else {
+            // DREAM MODE:
+            // 1. Apply a slight "Zoom Out" (scale > 1.0) to counteract feedback loop expansion
+            // 2. Add a gentle drift so the dream moves around
+            let zoom_out = 1.02; 
+            let drift = vec2<f32>(sin(params.time * 0.5), cos(params.time * 0.4)) * 0.02;
+            
+            // Center the UVs, Scale, then Un-center
+            let dream_uv = (uv - 0.5) * zoom_out + 0.5 + drift;
+
+            reality = textureSampleLevel(input_tex, input_sampler, dream_uv, 0.0).r;
+
+            // Add noise to keep the hallucination active
+            let noise = rand(post_idx + u32(params.time * 100.0)) - 0.5;
+            reality += noise * 0.05;
+        }
+        
         let reality_val = (reality - 0.5) * 3.0; 
 
         // Compute prediction from cortex (top-down)

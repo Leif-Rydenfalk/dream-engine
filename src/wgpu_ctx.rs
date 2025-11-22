@@ -344,6 +344,21 @@ impl<'window> WgpuCtx<'window> {
                     }
                     ui.separator();
 
+                    // Dream Mode Toggle
+                    let mut use_cam = self.brain_system.params.use_camera == 1;
+                    if ui.checkbox("Camera Input", &mut use_cam) {
+                        self.brain_system.params.use_camera = if use_cam { 1 } else { 0 };
+                    }
+                    if !use_cam {
+                        ui.same_line();
+                        ui.text_colored([0.5, 1.0, 0.5, 1.0], "(DREAMING)");
+                    }
+
+                    ui.separator();
+                    ui.text("Params");
+
+                    ui.separator();
+
                     ui.text("Architecture: Predictive Coding (HGF)");
                     ui.text("- Retina computes (Reality - Prediction)");
                     ui.text("- Cortex minimizes Error via Learning");
@@ -372,7 +387,7 @@ impl<'window> WgpuCtx<'window> {
 
                     ui.separator();
 
-                    // FIXED: Display 3 Columns
+                    // Display 3 Columns
                     if let (Some(in_id), Some(pred_id), Some(out_id)) = (
                         self.input_texture_id,
                         self.prediction_texture_id,

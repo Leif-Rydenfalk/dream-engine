@@ -81,7 +81,8 @@ pub struct SimParams {
     pub train_mode: u32,
     pub terror_threshold: f32,
     pub grid_dim: u32,
-    pub _pad: [f32; 4],
+    pub use_camera: u32,
+    pub _pad: [f32; 7],
 }
 
 #[repr(C)]
@@ -158,7 +159,8 @@ impl BrainSystem {
             train_mode: 1,
             terror_threshold: 0.5,
             grid_dim: GRID_DIM,
-            _pad: [0.0; 4], // Ensure this matches WGSL vec4 alignment
+            use_camera: 1,
+            _pad: [0.0; 7], // FIX: Updated to 7 elements
         };
 
         let kernel = SynapticKernel {
@@ -254,7 +256,7 @@ impl BrainSystem {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba32Float, // <--- CHANGED from Rgba8Unorm
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
@@ -283,7 +285,8 @@ impl BrainSystem {
             format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::STORAGE_BINDING,
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         }));
         let prediction_texture_view = Arc::new(prediction_texture.create_view(&Default::default()));
@@ -654,39 +657,62 @@ impl BrainSystem {
     pub fn update(&mut self, input: &crate::input::Input, _window_size: (u32, u32)) {
         self.params.time = self.start_time.elapsed().as_secs_f32();
 
+        // Toggle Train Mode (Space)
         if input.is_key_pressed(winit::keyboard::KeyCode::Space) {
             self.params.train_mode = if self.params.train_mode == 1 { 0 } else { 1 };
+        }
+
+        // Toggle Dream Mode (D)
+        if input.is_key_pressed(winit::keyboard::KeyCode::KeyD) {
+            self.params.use_camera = if self.params.use_camera == 1 { 0 } else { 1 };
             println!(
-                "Mode switched: {}",
-                if self.params.train_mode == 1 {
-                    "LEARNING (Plasticity ON)"
+                "Input Source: {}",
+                if self.params.use_camera == 1 {
+                    "CAMERA"
                 } else {
-                    "INFERENCE (Plasticity OFF)"
+                    "DREAM (Feedback Loop)"
                 }
             );
         }
 
-        if let Some(img) = self.camera.get_frame() {
-            let img = image::imageops::resize(&img, 512, 512, image::imageops::FilterType::Nearest);
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.input_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &img,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * 512),
-                    rows_per_image: Some(512),
-                },
-                wgpu::Extent3d {
-                    width: 512,
-                    height: 512,
-                    depth_or_array_layers: 1,
-                },
-            );
+        // Update Camera Input ONLY if active
+        if self.params.use_camera == 1 {
+            if let Some(img) = self.camera.get_frame() {
+                // 1. Resize (returns ImageBuffer<Rgba<u8>, Vec<u8>>)
+                let img_resized =
+                    image::imageops::resize(&img, 512, 512, image::imageops::FilterType::Nearest);
+
+                // 2. Manual Conversion: u8 [0..255] -> f32 [0.0..1.0]
+                // This creates a standard Vec<f32> which works perfectly with bytemuck
+                let raw_f32: Vec<f32> = img_resized
+                    .as_raw()
+                    .iter()
+                    .map(|&b| b as f32 / 255.0)
+                    .collect();
+
+                // 3. Cast slice for WGPU
+                let raw_bytes = bytemuck::cast_slice(&raw_f32);
+
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.input_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    raw_bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(16 * 512), // 4 floats * 4 bytes * 512 width
+                        rows_per_image: Some(512),
+                    },
+                    wgpu::Extent3d {
+                        width: 512,
+                        height: 512,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
         }
 
         self.queue
@@ -702,6 +728,29 @@ impl BrainSystem {
         depth_view: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
+        // DREAM MODE: Feed Prediction back into Input
+        if self.params.use_camera == 0 {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.prediction_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.input_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: 512,
+                    height: 512,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
         const RENDER_3D_VISUALIZATION: bool = true;
 
         {
