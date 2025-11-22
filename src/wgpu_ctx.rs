@@ -355,35 +355,10 @@ impl<'window> WgpuCtx<'window> {
                     }
 
                     ui.separator();
-                    ui.text("Params");
-
-                    ui.separator();
 
                     ui.text("Architecture: Predictive Coding (HGF)");
                     ui.text("- Retina computes (Reality - Prediction)");
                     ui.text("- Cortex minimizes Error via Learning");
-
-                    // ui.separator();
-                    // ui.text("Params");
-
-                    // let mut samples = self.brain_system.params.geometric_sample_count as i32;
-                    // if ui.slider("Samples/Frame", 16, 128, &mut samples) {
-                    //     self.brain_system.params.geometric_sample_count = samples as u32;
-                    // }
-
-                    // ui.slider(
-                    //     "Learning Rate",
-                    //     0.0,
-                    //     0.5,
-                    //     &mut self.brain_system.kernel.explicit_learning_rate,
-                    // );
-
-                    // ui.slider(
-                    //     "Promotion Threshold",
-                    //     0.1,
-                    //     1.0,
-                    //     &mut self.brain_system.kernel.promotion_threshold,
-                    // );
 
                     ui.separator();
 
