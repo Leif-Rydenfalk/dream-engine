@@ -11,10 +11,10 @@ const GRID_DIM: u32 = 512;
 pub struct Neuron {
     pub semantic: [u32; 4], // 16 bytes
     pub pos: [f32; 2],      // 8 bytes
-    pub voltage: f32,       // 4 bytes
-    pub prediction: f32,    // 4 bytes
-    pub precision: f32,     // 4 bytes
-    pub layer: u32,         // 4 bytes
+    pub voltage: f32,       // 4 bytes (Activation/Error)
+    pub prediction: f32,    // 4 bytes (Memoized state)
+    pub precision: f32,     // 4 bytes (Plasticity factor)
+    pub layer: u32,         // 4 bytes (0..6)
     pub _pad0: f32,         // 4 bytes
     pub _pad1: f32,         // 4 bytes
 } // Total 48 bytes
@@ -55,8 +55,7 @@ pub struct BrainSystem {
     pub prediction_texture_view: Arc<wgpu::TextureView>,
     pub camera: CameraFeed,
 
-    // We split the main compute bind group into two to handle
-    // the read/write conflict of the prediction texture.
+    // Split compute bind groups for read/write prediction texture conflict
     compute_bg_write: wgpu::BindGroup,
     compute_bg_read: wgpu::BindGroup,
 
@@ -179,7 +178,7 @@ impl BrainSystem {
         }));
         let prediction_texture_view = Arc::new(prediction_texture.create_view(&Default::default()));
 
-        // --- DUMMY TEXTURE FOR SPLIT BIND GROUPS ---
+        // Dummy texture for split bind groups
         let void_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Void Tex"),
             size: wgpu::Extent3d {
@@ -296,7 +295,6 @@ impl BrainSystem {
             ],
         });
 
-        // Common bindings 0-6
         let entries_common = vec![
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -332,11 +330,11 @@ impl BrainSystem {
         let mut entries_write = entries_common.clone();
         entries_write.push(wgpu::BindGroupEntry {
             binding: 7,
-            resource: wgpu::BindingResource::TextureView(&prediction_texture_view), // Real Write
+            resource: wgpu::BindingResource::TextureView(&prediction_texture_view),
         });
         entries_write.push(wgpu::BindGroupEntry {
             binding: 8,
-            resource: wgpu::BindingResource::TextureView(&void_view), // Dummy Read
+            resource: wgpu::BindingResource::TextureView(&void_view),
         });
 
         let compute_bg_write = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -349,11 +347,11 @@ impl BrainSystem {
         let mut entries_read = entries_common.clone();
         entries_read.push(wgpu::BindGroupEntry {
             binding: 7,
-            resource: wgpu::BindingResource::TextureView(&void_view), // Dummy Write
+            resource: wgpu::BindingResource::TextureView(&void_view),
         });
         entries_read.push(wgpu::BindGroupEntry {
             binding: 8,
-            resource: wgpu::BindingResource::TextureView(&prediction_texture_view), // Real Read
+            resource: wgpu::BindingResource::TextureView(&prediction_texture_view),
         });
 
         let compute_bg_read = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -605,13 +603,13 @@ impl BrainSystem {
         target: &wgpu::TextureView,
     ) {
         // --- COMPUTE PASS 1: WRITE PHASE (Write to Prediction) ---
+        // This pass calculates the new predictions from the network state
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Compute Phase 1 (Write)"),
                 timestamp_writes: None,
             });
 
-            // Use Write Bind Group
             cpass.set_bind_group(0, &self.compute_bg_write, &[]);
 
             if !self.initialized {
@@ -629,12 +627,12 @@ impl BrainSystem {
             cpass.set_pipeline(&self.clear_cortex_pipeline);
             cpass.dispatch_workgroups(64, 64, 1);
 
-            // This writes to prediction texture
+            // This writes to prediction texture from L6 neurons
             cpass.set_pipeline(&self.render_dream_pipeline);
             cpass.dispatch_workgroups(64, 64, 1);
         }
 
-        // *** MOVE THE COPY HERE - AFTER DREAM GENERATES NEW PREDICTIONS ***
+        // If camera is off, copy the dream back to input for feedback loop
         if self.params.use_camera == 0 {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -658,16 +656,15 @@ impl BrainSystem {
         }
 
         // --- COMPUTE PASS 2: READ PHASE (Read from Prediction) ---
+        // This pass updates neurons based on the error between Input and Prediction
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Compute Phase 2 (Read)"),
                 timestamp_writes: None,
             });
 
-            // Use Read Bind Group
             cpass.set_bind_group(0, &self.compute_bg_read, &[]);
 
-            // This reads from prediction texture
             cpass.set_pipeline(&self.update_neurons_pipeline);
             cpass.dispatch_workgroups((NEURON_COUNT + 63) / 64, 1, 1);
 

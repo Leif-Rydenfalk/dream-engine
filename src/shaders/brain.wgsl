@@ -5,19 +5,18 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
 };
 
-// COMPRESSED NEURON: 48 Bytes
 struct Neuron {
     // 128-bit Semantic Hypervector (SDR Identity)
     semantic: vec4<u32>,  // 16 bytes
     
-    // Spatial Position
+    // Spatial Position (-1.0 to 1.0)
     pos: vec2<f32>,       // 8 bytes
     
-    // Predictive Coding State
-    voltage: f32,         // 4 bytes (Error)
-    prediction: f32,      // 4 bytes (Prediction/Mu)
-    precision_value: f32,       // 4 bytes (Precision/Inverse Sigma)
-    layer: u32,           // 4 bytes
+    // State
+    voltage: f32,         // 4 bytes (Activation/Error)
+    prediction: f32,      // 4 bytes (Memoized State/Visualization)
+    precision_value: f32, // 4 bytes (Plasticity factor)
+    layer: u32,           // 4 bytes (0..6)
     
     // Padding
     pad0: f32,            
@@ -50,8 +49,8 @@ struct LineVertex {
 @group(0) @binding(4) var input_tex: texture_2d<f32>;
 @group(0) @binding(5) var input_sampler: sampler;
 @group(0) @binding(6) var output_tex: texture_storage_2d<rgba32float, write>;
-@group(0) @binding(7) var prediction_tex: texture_storage_2d<rgba32float, write>; // Write-only for Dream Pass
-@group(0) @binding(8) var prediction_tex_read: texture_2d<f32>;                // Read-only for Update Pass
+@group(0) @binding(7) var prediction_tex: texture_storage_2d<rgba32float, write>; // L6 writes here
+@group(0) @binding(8) var prediction_tex_read: texture_2d<f32>;                // L0 reads here
 
 // --- UTILITY ---
 
@@ -91,18 +90,23 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     var n: Neuron;
     let seed = idx * 7123u;
     
-    // Init Semantic Hypervector (Random SDR)
+    // Random SDR Semantic
     n.semantic = vec4<u32>(hash(seed), hash(seed+1u), hash(seed+2u), hash(seed+3u));
+    n.voltage = 0.0;
+    n.prediction = rand_f32(seed+6u) * 0.5 + 0.25;
     
-    // Layer Distribution
-    // L0: Retina (25,600)
-    // L1: V1 (~43k)
-    // L2: V2 (~43k)
-    // L3: V4 (~43k)
-    // L4: IT (~43k)
+    // --- LAYER ARCHITECTURE ---
+    // L0: Retina Input (25,600 neurons, dense grid)
+    // L1-L3: Encoder Path (Compression)
+    // L3: Bottleneck
+    // L4-L5: Decoder Path (Reconstruction)
+    // L6: Prediction Output (25,600 neurons, dense grid)
     
-    if (idx < 25600u) {
-        n.layer = 0u; // Retina
+    let retina_count = 25600u;
+    
+    if (idx < retina_count) {
+        // L0: Input Retina
+        n.layer = 0u; 
         let dim = 160u;
         let rx = idx % dim;
         let ry = idx / dim;
@@ -110,21 +114,32 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         let v = f32(ry) / f32(dim);
         n.pos = vec2<f32>(u * 2.0 - 1.0, v * 2.0 - 1.0);
         n.precision_value = 10.0; 
+    } else if (idx < retina_count * 2u) {
+        // L6: Output Prediction
+        n.layer = 6u; 
+        let i = idx - retina_count;
+        let dim = 160u;
+        let rx = i % dim;
+        let ry = i / dim;
+        let u = f32(rx) / f32(dim);
+        let v = f32(ry) / f32(dim);
+        n.pos = vec2<f32>(u * 2.0 - 1.0, v * 2.0 - 1.0);
+        n.precision_value = 10.0;
     } else {
-        if (idx < 69200u) { n.layer = 1u; }
-        else if (idx < 112800u) { n.layer = 2u; }
-        else if (idx < 156400u) { n.layer = 3u; }
-        else { n.layer = 4u; }
+        // L1..L5: Hidden Layers (Bottleneck)
+        let rem_idx = idx - retina_count * 2u;
+        let rem_total = params.neuron_count - retina_count * 2u;
         
-        // Cortex positions are random but can be topologically organized by seed
-        // To allow local connections, we map them roughly to screen space but with jitter
+        // Distribute evenly across 5 hidden layers
+        let split = rem_total / 5u;
+        let l_offset = rem_idx / split;
+        n.layer = clamp(l_offset + 1u, 1u, 5u);
+        
+        // Topological Map + Jitter
+        // We seed position based on index to keep spatial coherence, but add randomness
         n.pos = vec2<f32>(rand_f32(seed+4u), rand_f32(seed+5u)) * 2.0 - 1.0;
         n.precision_value = 1.0;
     }
-    
-    // Initialize with non-zero predictions to avoid collapse
-    n.voltage = 0.0;
-    n.prediction = rand_f32(seed+6u) * 0.5 + 0.25; // 0.25-0.75 range
     
     neurons[idx] = n;
 }
@@ -146,104 +161,82 @@ fn cs_populate_grid(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
-    let post_idx = id.x;
-    if (post_idx >= params.neuron_count) { return; }
+    let idx = id.x;
+    if (idx >= params.neuron_count) { return; }
     
-    var post = neurons[post_idx];
+    var n = neurons[idx];
     
-    // ---------------------------------------------------------
-    // LAYER 0: RETINA (Sensor)
-    // ---------------------------------------------------------
-    if (post.layer == 0u) {
-        let uv = (post.pos + 1.0) * 0.5;
+    // --- L0: RETINA (COMPARE REALITY vs PREDICTION) ---
+    if (n.layer == 0u) {
+        let uv = (n.pos + 1.0) * 0.5;
         
-        // 1. Sample Reality (Input)
+        // 1. Sample Reality
         var reality = 0.0;
         if (params.use_camera == 1u) {
             reality = textureSampleLevel(input_tex, input_sampler, uv, 0.0).r;
         } else {
-            // Dream mode noise/drift
+            // Dream noise if camera off
             let t = params.time;
-            let warp = uv + vec2<f32>(sin(uv.y*4.0+t), cos(uv.x*4.0+t)) * 0.02;
-            reality = textureSampleLevel(input_tex, input_sampler, warp, 0.0).r;
-            reality += (rand_f32(post_idx + u32(t * 60.0)) - 0.5) * 0.1;
+            reality = (rand_f32(idx + u32(t * 60.0)) - 0.5) * 0.1 + 0.5;
         }
         
-        // 2. Sample Prediction (Feedback from Cortex)
-        // READ from the read-only binding
-        let top_down_pred = textureLoad(prediction_tex_read, vec2<i32>(uv * 512.0), 0).r;
+        // 2. Sample Prediction (Top-Down from L6)
+        let prediction = textureLoad(prediction_tex_read, vec2<i32>(uv * 512.0), 0).r;
         
-        // 3. Predictive Coding for Retina
-        // Update prediction to match reality (with top-down modulation)
-        post.prediction = mix(reality, top_down_pred, 0.3); // Blend reality with expectation
+        // 3. Compute Error
+        // L0 Voltage = Prediction Error. This drives L1.
+        n.voltage = reality - prediction; 
         
-        // 4. Compute Error (Voltage) - this gets sent UP to Layer 1
-        // Voltage = Sensory Activity (for feedforward)
-        post.voltage = reality; // Pass through the sensory signal
+        // Store reality in prediction slot just for visualization debugging
+        n.prediction = reality; 
         
-        neurons[post_idx] = post;
-        return; // Early exit - retina doesn't do cortical processing
+        neurons[idx] = n;
+        return;
     }
 
-    // ---------------------------------------------------------
-    // LAYERS 1-4: CORTEX (Predictive Processing)
-    // ---------------------------------------------------------
+    // --- L1..L6: HIERARCHICAL CHAIN ---
+    // Each layer samples from the layer conceptually "below" it in the feedforward chain.
+    // Chain: L0 -> L1 -> L2 -> L3 -> L4 -> L5 -> L6
+    // L1-L3: Encoder (Abstracting Error)
+    // L4-L6: Decoder (Reconstructing Prediction)
     
-    var driver_accum = 0.0; // Feedforward (L-1)
-    var driver_weight = 0.0;
+    let source_layer = n.layer - 1u;
     
-    var context_accum = 0.0; // Lateral (L)
-    var context_weight = 0.0;
-    
-    var best_driver_idx = 0xFFFFFFFFu;
+    var accum = 0.0;
+    var weight_sum = 0.0;
+    var best_source_idx = 0xFFFFFFFFu;
     var max_sim = 0.0;
-
-    let grid_dim = f32(params.grid_dim);
-    let center_u = (post.pos.x + 1.0) * 0.5 * grid_dim;
-    let center_v = (post.pos.y + 1.0) * 0.5 * grid_dim;
     
-    // Search Neighborhood
-    for (var dy = -2; dy <= 2; dy++) {
-        for (var dx = -2; dx <= 2; dx++) {
+    let grid_dim = f32(params.grid_dim);
+    let center_u = (n.pos.x + 1.0) * 0.5 * grid_dim;
+    let center_v = (n.pos.y + 1.0) * 0.5 * grid_dim;
+    
+    // Receptive Field Search (Spatial Locality)
+    let rf_rad = 2;
+    for (var dy = -rf_rad; dy <= rf_rad; dy++) {
+        for (var dx = -rf_rad; dx <= rf_rad; dx++) {
             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
             let g_idx = gx + gy * params.grid_dim;
             
-            let pre_idx = atomicLoad(&spatial_grid[g_idx]);
-            
-            if (pre_idx != 0xFFFFFFFFu && pre_idx != post_idx) {
-                let pre = neurons[pre_idx];
-                
-                // Spatial filter
-                let d_vec = post.pos - pre.pos;
-                let d2 = dot(d_vec, d_vec);
-                
-                if (d2 < 0.12) {
-                    let spatial_w = exp(-d2 * 30.0);
-                    let semantic_w = hamming_similarity(post.semantic, pre.semantic);
-                    
-                    // Determine Role based on Layer
-                    // Feedforward: L-1 -> L
-                    if (pre.layer == post.layer - 1u) {
-                        let w = spatial_w * (semantic_w * semantic_w + 0.01);
+            let src_idx = atomicLoad(&spatial_grid[g_idx]);
+            if (src_idx != 0xFFFFFFFFu) {
+                let src = neurons[src_idx];
+                if (src.layer == source_layer) {
+                    let dist = distance(n.pos, src.pos);
+                    if (dist < 0.15) { // RF Radius
+                        // Filter by Semantic Similarity
+                        let sim = hamming_similarity(n.semantic, src.semantic);
+                        let w = sim * exp(-dist * 10.0);
+                        
                         if (w > 0.001) {
-                            // Driver sends Error (Voltage)
-                            driver_accum += pre.voltage * w;
-                            driver_weight += w;
+                            accum += src.voltage * w;
+                            weight_sum += w;
                             
-                            if (semantic_w > max_sim) {
-                                max_sim = semantic_w;
-                                best_driver_idx = pre_idx;
+                            if (sim > max_sim) {
+                                max_sim = sim;
+                                best_source_idx = src_idx;
                             }
-                        }
-                    }
-                    // Lateral: L -> L
-                    else if (pre.layer == post.layer) {
-                        let w = spatial_w * (semantic_w + 0.01);
-                        if (w > 0.001) {
-                            // Context sends Activity/Belief (Prediction)
-                            context_accum += pre.prediction * w;
-                            context_weight += w;
                         }
                     }
                 }
@@ -251,72 +244,31 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
-    // Normalize Signals
-    let driver_in = select(0.0, driver_accum / driver_weight, driver_weight > 0.0);
-    let context_in = select(0.0, context_accum / context_weight, context_weight > 0.0);
-    
-    // ---------------------------------------------------------
-    // PREDICTIVE CODING UPDATE RULE
-    // ---------------------------------------------------------
-    
-    // 1. Update Prediction (Internal Belief)
-    // Combine: Driver (bottom-up input) + Context (lateral predictions)
-    let alpha = 0.2; // Learning rate
-    let beta = 0.3;  // Context influence
-    
-    // Prediction is a weighted blend of bottom-up and lateral
-    let combined = mix(driver_in, context_in, beta);
-    post.prediction = mix(post.prediction, combined, alpha);
-    
-    // 2. Update Voltage (Prediction Error)
-    // Error = Input (from below) - Prediction (from self)
-    // This Error propagates up to the next layer
-    let error_mag = abs(driver_in - post.prediction);
-    post.voltage = error_mag * sign(driver_in - post.prediction);
-    
-    // 3. Update Precision
-    // Inverse variance of the error
-    post.precision_value = mix(post.precision_value, 1.0 / (error_mag + 0.1), 0.05);
-
-    // ---------------------------------------------------------
-    // VSA LEARNING (Plasticity)
-    // ---------------------------------------------------------
-    if (params.train_mode == 1u && best_driver_idx != 0xFFFFFFFFu) {
-        let driver = neurons[best_driver_idx];
+    // Update Activation
+    if (weight_sum > 0.001) {
+        let input = accum / weight_sum;
+        // Temporal smoothing / Leaky integrator
+        n.voltage = mix(n.voltage, input, 0.2);
         
-        // If we have significant error to explain
-        if (error_mag > 0.1) {
-            // "Transitions" learning: Move towards (Driver XOR Context)
-            // If context is weak, just move towards Driver
-            
-            let target_semantic = driver.semantic;
-            // Simple bit-flip plasticity towards the driver that caused the error
-            // This aligns the RF to explain the input
-            
-            let diff = post.semantic ^ target_semantic;
-            let seed = id.x + u32(params.time * 1000.0);
-            let mask = vec4<u32>(
-                 hash(seed), hash(seed+1u), hash(seed+2u), hash(seed+3u)
-            );
-            
-            // 1% learning rate
-            let update_mask = mask & vec4<u32>(0x01010101u);
-            post.semantic = (post.semantic & ~update_mask) | (target_semantic & update_mask);
+        // Plasticity: VSA Learning
+        // Adjust semantic hypervector to better match the source pattern
+        if (params.train_mode == 1u && best_source_idx != 0xFFFFFFFFu) {
+             let src = neurons[best_source_idx];
+             let seed = id.x + u32(params.time * 1000.0);
+             let mask = vec4<u32>(hash(seed), hash(seed+1u), hash(seed+2u), hash(seed+3u));
+             
+             // Higher learning rate for Bottleneck (L3) to force abstraction
+             let lr_mask = select(0x00010101u, 0x01010101u, n.layer == 3u); 
+             let update_mask = mask & vec4<u32>(lr_mask);
+             
+             // Move towards source semantic
+             n.semantic = (n.semantic & ~update_mask) | (src.semantic & update_mask);
         }
+    } else {
+        n.voltage *= 0.9; // Decay if no input
     }
 
-    neurons[post_idx] = post;
-
-    // Visualization
-    let cortex_uv = (post.pos + 1.0) * 0.5;
-    let tx = i32(cortex_uv.x * 512.0);
-    let ty = i32(cortex_uv.y * 512.0);
-    if (tx >= 0 && tx < 512 && ty >= 0 && ty < 512) {
-        let v = post.voltage; // Show error
-        // Red = Positive Error, Blue = Negative Error, Green = Prediction
-        let col = vec4<f32>(max(0.0, v), abs(post.prediction)*0.5, max(0.0, -v), 1.0);
-        textureStore(output_tex, vec2<i32>(tx, ty), col);
-    }
+    neurons[idx] = n;
 }
 
 @compute @workgroup_size(64)
@@ -326,61 +278,74 @@ fn cs_generate_lines(@builtin(global_invocation_id) id: vec3<u32>) {
     
     let n = neurons[idx];
     
-    // Only draw lines for active neurons
-    if (abs(n.voltage) < 0.1) {
+    // Sparsity threshold
+    if (abs(n.voltage) < 0.05) {
         line_buffer[idx*2].pos = vec4<f32>(0.0);
         line_buffer[idx*2+1].pos = vec4<f32>(0.0);
         return;
     }
     
-    var best_pre_idx = 0xFFFFFFFFu;
-    var best_w = 0.0;
+    if (n.layer == 0u) { return; }
+    let source_layer = n.layer - 1u;
     
-    // Visualize the strongest FEEDFORWARD connection
+    var best_idx = 0xFFFFFFFFu;
+    var best_dist = 100.0;
+    
     let grid_dim = f32(params.grid_dim);
     let center_u = (n.pos.x + 1.0) * 0.5 * grid_dim;
     let center_v = (n.pos.y + 1.0) * 0.5 * grid_dim;
     
+    // Find best connection to draw
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
-            let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
-            let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-            let g_idx = gx + gy * params.grid_dim;
-            
-            let pre_idx = atomicLoad(&spatial_grid[g_idx]);
-            if (pre_idx != 0xFFFFFFFFu && pre_idx != idx) {
-                 let pre = neurons[pre_idx];
-                 if (pre.layer == n.layer - 1u) { // Visualize Drivers
-                     let sim = hamming_similarity(n.semantic, pre.semantic);
-                     let dist = distance(n.pos, pre.pos);
-                     let w = sim / (dist + 0.01);
-                     if (w > best_w) {
-                         best_w = w;
-                         best_pre_idx = pre_idx;
+             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+             let src_idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim]);
+             
+             if (src_idx != 0xFFFFFFFFu) {
+                 let src = neurons[src_idx];
+                 if (src.layer == source_layer) {
+                     let d = distance(n.pos, src.pos);
+                     let sim = hamming_similarity(n.semantic, src.semantic);
+                     
+                     // Weight connection strength by proximity and similarity
+                     let score = d / (sim + 0.1);
+                     
+                     if (score < best_dist) {
+                         best_dist = score;
+                         best_idx = src_idx;
                      }
                  }
-            }
+             }
         }
     }
     
-    if (best_pre_idx != 0xFFFFFFFFu) {
-        let target_value = neurons[best_pre_idx];
-        // Stack layers in Z for visualization
-        // Layer 0 at z=-1.0, Layer 4 at z=1.0
-        let z_post = (f32(n.layer) * 0.5) - 1.0;
-        let z_pre = (f32(target_value.layer) * 0.5) - 1.0;
+    if (best_idx != 0xFFFFFFFFu) {
+        let src = neurons[best_idx];
         
-        let origin = vec3<f32>(n.pos, z_post) * 3.0;
-        let dest = vec3<f32>(target_value.pos, z_pre) * 3.0;
+        // Z-Stack Visualization
+        // Map layers 0..6 to -3.0..3.0 range
+        let z_curr = f32(n.layer) - 3.0;
+        let z_src = f32(src.layer) - 3.0;
         
-        let alpha = clamp(best_w * 0.5, 0.1, 0.5);
-        // Cyan lines
-        let col = vec3<f32>(0.0, 1.0, 0.8); 
+        // 3.0 multiplier matches vs_main scaling
+        let p1 = vec3<f32>(n.pos, z_curr * 0.5) * 3.0;
+        let p2 = vec3<f32>(src.pos, z_src * 0.5) * 3.0;
         
-        line_buffer[idx*2].pos = vec4<f32>(origin, 1.0);
-        line_buffer[idx*2].color = vec4<f32>(col, alpha);
-        line_buffer[idx*2+1].pos = vec4<f32>(dest, 1.0);
-        line_buffer[idx*2+1].color = vec4<f32>(col, alpha);
+        var col = vec4<f32>(1.0);
+        
+        if (n.layer <= 3u) {
+            // Encoder Path (Error propagation): RED
+            col = vec4<f32>(1.0, 0.1, 0.1, 0.3); 
+        } else {
+            // Decoder Path (Prediction generation): CYAN
+            col = vec4<f32>(0.0, 1.0, 1.0, 0.3);
+        }
+        
+        line_buffer[idx*2].pos = vec4<f32>(p1, 1.0);
+        line_buffer[idx*2].color = col;
+        line_buffer[idx*2+1].pos = vec4<f32>(p2, 1.0);
+        line_buffer[idx*2+1].color = col;
     } else {
         line_buffer[idx*2].pos = vec4<f32>(0.0);
         line_buffer[idx*2+1].pos = vec4<f32>(0.0);
@@ -393,46 +358,36 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= dim.x || id.y >= dim.y) { return; }
     
     let uv = vec2<f32>(f32(id.x) / 512.0, f32(id.y) / 512.0);
-    let screen_pos = uv * 2.0 - 1.0;
+    let pos = uv * 2.0 - 1.0;
     
-    // Accumulate predictions from ALL cortical layers (hierarchical blending)
-    var pred_accum = 0.0;
-    var weight_accum = 0.0;
+    // Sample L6 neurons (The Predictor Layer)
+    var val = 0.0;
+    var w_sum = 0.0;
     
     let grid_dim = f32(params.grid_dim);
     let center_u = uv.x * grid_dim;
     let center_v = uv.y * grid_dim;
     
-    // Sample nearby neurons from multiple layers
-    for (var dy = -3; dy <= 3; dy++) {
-        for (var dx = -3; dx <= 3; dx++) {
-            let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
-            let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-            let g_idx = gx + gy * params.grid_dim;
-            
-            let n_idx = atomicLoad(&spatial_grid[g_idx]);
-            if (n_idx != 0xFFFFFFFFu) {
-                let n = neurons[n_idx];
-                // Use layers 1-4 with layer-dependent influence
-                if (n.layer >= 1u && n.layer <= 4u) {
-                    let dist2 = dot(screen_pos - n.pos, screen_pos - n.pos);
-                    // Higher layers have broader receptive fields
-                    let rf_size = 0.01 + f32(n.layer) * 0.005;
-                    if (dist2 < rf_size) {
-                        // Weight by layer (higher layers = more abstract, stronger influence)
-                        let layer_weight = pow(1.5, f32(n.layer) - 1.0);
-                        let spatial_weight = exp(-dist2 / (rf_size * 0.3));
-                        let w = spatial_weight * layer_weight;
-                        pred_accum += n.prediction * w;
-                        weight_accum += w;
-                    }
-                }
-            }
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+             let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim]);
+             
+             if (idx != 0xFFFFFFFFu) {
+                 let n = neurons[idx];
+                 if (n.layer == 6u) {
+                     let d = distance(pos, n.pos);
+                     let w = exp(-d * 50.0); // Smooth reconstruction kernel
+                     val += n.voltage * w;
+                     w_sum += w;
+                 }
+             }
         }
     }
     
-    let final_pred = select(0.0, pred_accum / weight_accum, weight_accum > 0.001);
-    textureStore(prediction_tex, vec2<i32>(id.xy), vec4<f32>(final_pred, final_pred, final_pred, 1.0));
+    let final_color = select(0.0, val / w_sum, w_sum > 0.001);
+    textureStore(prediction_tex, vec2<i32>(id.xy), vec4<f32>(final_color, final_color, final_color, 1.0));
 }
 
 @compute @workgroup_size(8, 8)
@@ -442,7 +397,7 @@ fn cs_clear_cortex(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
 }
 
-// --- RENDERING VERTEX SHADER ---
+// --- RENDERING SHADERS ---
 
 @group(1) @binding(0) var<uniform> camera_uni: Camera;
 
@@ -460,24 +415,28 @@ fn vs_main(@location(0) vertex_pos: vec3<f32>, @builtin(instance_index) idx: u32
     var out: VertexOutput;
     let n = neurons[idx];
     
-    // Stack layers in Z: -1.0 to 1.0
-    let z_depth = (f32(n.layer) * 0.5) - 1.0;
+    // Stack layers in Z
+    // Layer 0 at Z -3.0, Layer 3 at 0.0, Layer 6 at +3.0
+    let z_depth = (f32(n.layer) - 3.0) * 0.5;
     
     let world_pos = vec3<f32>(n.pos, z_depth) * 3.0 + vertex_pos * 0.015;
     out.clip_position = camera_uni.view_proj * vec4<f32>(world_pos, 1.0);
     
     var col = vec3<f32>(0.2);
+    let val = n.voltage;
     
     if (n.layer == 0u) {
-        // Retina: White/Black
-        let v = n.voltage + 0.5;
-        col = vec3<f32>(v, v, v);
+        // L0 (Retina): White = Active, Red = Negative Error
+        col = vec3<f32>(val + 0.5, val + 0.5, val + 0.5);
+    } else if (n.layer <= 3u) {
+        // Encoder: Red intensity (representing Error magnitude)
+        col = vec3<f32>(abs(val)*2.0, 0.0, 0.0);
+    } else if (n.layer < 6u) {
+        // Decoder: Cyan intensity (representing Reconstruction features)
+        col = vec3<f32>(0.0, abs(val)*2.0, abs(val)*2.0);
     } else {
-        // Cortex: Color by Precision/Error
-        let err = abs(n.voltage);
-        let pred = n.prediction;
-        // Red = Error, Green = Pred, Blue = Layer ID
-        col = vec3<f32>(err, max(0.0, pred), f32(n.layer)*0.2);
+        // L6 (Prediction Output): Greenish/White
+        col = vec3<f32>(val, val + 0.2, val); 
     }
     
     out.color = vec4<f32>(col, 1.0);
