@@ -1,11 +1,13 @@
 use crate::{BrainSystem, ImguiState, Input};
 use cgmath::{Matrix4, SquareMatrix};
+use dotenv::dotenv; // Added dotenv
 use hecs::World;
 use imgui::*;
 use imgui_wgpu::{Renderer, RendererConfig, Texture as ImguiTexture};
 use imgui_winit_support::WinitPlatform;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::env; // Added std::env
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -87,7 +89,7 @@ pub struct WgpuCtx<'window> {
 
     // ImGui Texture IDs
     input_texture_id: Option<TextureId>,
-    prediction_texture_id: Option<TextureId>, // New field
+    prediction_texture_id: Option<TextureId>,
     output_texture_id: Option<TextureId>,
 
     time: Instant,
@@ -95,6 +97,9 @@ pub struct WgpuCtx<'window> {
 
 impl<'window> WgpuCtx<'window> {
     pub async fn new_async(window: Arc<Window>) -> Self {
+        // Load environment variables from .env file
+        dotenv().ok();
+
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
         let adapter = instance
@@ -192,8 +197,9 @@ impl<'window> WgpuCtx<'window> {
         });
         let depth_texture_view = depth_texture.create_view(&Default::default());
 
-        // Initialize Brain
-        let camera_url = "http://192.168.50.208:8080/shot.jpg".to_string();
+        // Initialize Brain with Environment Variable
+        let camera_url = env::var("CAMERA_URL")
+            .unwrap_or_else(|_| "http://192.168.20.202:8080/shot.jpg".to_string());
 
         let brain_system = BrainSystem::new(
             Arc::clone(&device),
@@ -208,7 +214,6 @@ impl<'window> WgpuCtx<'window> {
         let mut imgui = Self::init_imgui(&device, &queue, &window, surface_config.format);
 
         // Register Brain Textures with ImGui
-        // FIXED: Destructuring 6 items now
         let (in_tex, in_view, pred_tex, pred_view, out_tex, out_view) = brain_system.get_textures();
 
         let brain_tex_size = wgpu::Extent3d {

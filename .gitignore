@@ -26,3 +26,5 @@ Cargo.lock
 /*png
 
 .DS_Store
+
+.env
