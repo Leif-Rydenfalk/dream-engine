@@ -6,7 +6,7 @@ Open source attempt at simulating dreams and learning in real time on cheap hard
 cargo run --release
 ´´´
 
-Currently running at 90fps on my 3gb gtx 1060
+90fps on 3gb gtx 1060
 
 ## Screenshots
 
