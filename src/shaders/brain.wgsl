@@ -187,7 +187,7 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     let grid_dim = f32(params.grid_dim);
     let center_u = (post.pos.x + 1.0) * 0.5 * grid_dim;
     let center_v = (post.pos.y + 1.0) * 0.5 * grid_dim;
-    
+
     for (var dy = -2; dy <= 2; dy++) {
         for (var dx = -2; dx <= 2; dx++) {
             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
