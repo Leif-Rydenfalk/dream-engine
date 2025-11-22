@@ -4,7 +4,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 const NEURON_COUNT: u32 = 200_000;
-const GRID_DIM: u32 = 128;
+const GRID_DIM: u32 = 512;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -604,28 +604,6 @@ impl BrainSystem {
         depth_view: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
-        if self.params.use_camera == 0 {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.prediction_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.input_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: 512,
-                    height: 512,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
         // --- COMPUTE PASS 1: WRITE PHASE (Write to Prediction) ---
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -654,6 +632,29 @@ impl BrainSystem {
             // This writes to prediction texture
             cpass.set_pipeline(&self.render_dream_pipeline);
             cpass.dispatch_workgroups(64, 64, 1);
+        }
+
+        // *** MOVE THE COPY HERE - AFTER DREAM GENERATES NEW PREDICTIONS ***
+        if self.params.use_camera == 0 {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.prediction_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.input_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: 512,
+                    height: 512,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
         // --- COMPUTE PASS 2: READ PHASE (Read from Prediction) ---

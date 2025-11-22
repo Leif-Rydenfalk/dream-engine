@@ -122,8 +122,9 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         n.precision_value = 1.0;
     }
     
+    // Initialize with non-zero predictions to avoid collapse
     n.voltage = 0.0;
-    n.prediction = 0.0;
+    n.prediction = rand_f32(seed+6u) * 0.5 + 0.25; // 0.25-0.75 range
     
     neurons[idx] = n;
 }
@@ -172,13 +173,16 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         // READ from the read-only binding
         let top_down_pred = textureLoad(prediction_tex_read, vec2<i32>(uv * 512.0), 0).r;
         
-        // 3. Compute Error (Voltage)
-        // Voltage = Reality - Prediction
-        post.voltage = (reality - top_down_pred) * 2.0;
-        post.prediction = top_down_pred; // Store what we thought
+        // 3. Predictive Coding for Retina
+        // Update prediction to match reality (with top-down modulation)
+        post.prediction = mix(reality, top_down_pred, 0.3); // Blend reality with expectation
+        
+        // 4. Compute Error (Voltage) - this gets sent UP to Layer 1
+        // Voltage = Sensory Activity (for feedforward)
+        post.voltage = reality; // Pass through the sensory signal
         
         neurons[post_idx] = post;
-        return;
+        return; // Early exit - retina doesn't do cortical processing
     }
 
     // ---------------------------------------------------------
@@ -214,7 +218,7 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
                 let d_vec = post.pos - pre.pos;
                 let d2 = dot(d_vec, d_vec);
                 
-                if (d2 < 0.06) {
+                if (d2 < 0.12) {
                     let spatial_w = exp(-d2 * 30.0);
                     let semantic_w = hamming_similarity(post.semantic, pre.semantic);
                     
@@ -256,18 +260,22 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     // ---------------------------------------------------------
     
     // 1. Update Prediction (Internal Belief)
-    // Driven by Context (Lateral) and previous state
-    let alpha = 0.1 * post.precision_value;
-    post.prediction = mix(post.prediction, context_in, alpha);
+    // Combine: Driver (bottom-up input) + Context (lateral predictions)
+    let alpha = 0.2; // Learning rate
+    let beta = 0.3;  // Context influence
+    
+    // Prediction is a weighted blend of bottom-up and lateral
+    let combined = mix(driver_in, context_in, beta);
+    post.prediction = mix(post.prediction, combined, alpha);
     
     // 2. Update Voltage (Prediction Error)
-    // Error = Input (from below) - Prediction (from self/lateral)
+    // Error = Input (from below) - Prediction (from self)
     // This Error propagates up to the next layer
-    post.voltage = driver_in - post.prediction;
+    let error_mag = abs(driver_in - post.prediction);
+    post.voltage = error_mag * sign(driver_in - post.prediction);
     
     // 3. Update Precision
     // Inverse variance of the error
-    let error_mag = abs(post.voltage);
     post.precision_value = mix(post.precision_value, 1.0 / (error_mag + 0.1), 0.05);
 
     // ---------------------------------------------------------
@@ -384,10 +392,47 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
     let dim = vec2<u32>(512, 512);
     if (id.x >= dim.x || id.y >= dim.y) { return; }
     
-    // We can now safely write to binding 7 (prediction_tex)
-    // because this runs in a separate pass from the reader.
+    let uv = vec2<f32>(f32(id.x) / 512.0, f32(id.y) / 512.0);
+    let screen_pos = uv * 2.0 - 1.0;
     
-    textureStore(prediction_tex, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+    // Accumulate predictions from ALL cortical layers (hierarchical blending)
+    var pred_accum = 0.0;
+    var weight_accum = 0.0;
+    
+    let grid_dim = f32(params.grid_dim);
+    let center_u = uv.x * grid_dim;
+    let center_v = uv.y * grid_dim;
+    
+    // Sample nearby neurons from multiple layers
+    for (var dy = -3; dy <= 3; dy++) {
+        for (var dx = -3; dx <= 3; dx++) {
+            let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+            let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+            let g_idx = gx + gy * params.grid_dim;
+            
+            let n_idx = atomicLoad(&spatial_grid[g_idx]);
+            if (n_idx != 0xFFFFFFFFu) {
+                let n = neurons[n_idx];
+                // Use layers 1-4 with layer-dependent influence
+                if (n.layer >= 1u && n.layer <= 4u) {
+                    let dist2 = dot(screen_pos - n.pos, screen_pos - n.pos);
+                    // Higher layers have broader receptive fields
+                    let rf_size = 0.01 + f32(n.layer) * 0.005;
+                    if (dist2 < rf_size) {
+                        // Weight by layer (higher layers = more abstract, stronger influence)
+                        let layer_weight = pow(1.5, f32(n.layer) - 1.0);
+                        let spatial_weight = exp(-dist2 / (rf_size * 0.3));
+                        let w = spatial_weight * layer_weight;
+                        pred_accum += n.prediction * w;
+                        weight_accum += w;
+                    }
+                }
+            }
+        }
+    }
+    
+    let final_pred = select(0.0, pred_accum / weight_accum, weight_accum > 0.001);
+    textureStore(prediction_tex, vec2<i32>(id.xy), vec4<f32>(final_pred, final_pred, final_pred, 1.0));
 }
 
 @compute @workgroup_size(8, 8)
