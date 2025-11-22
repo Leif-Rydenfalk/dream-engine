@@ -3,55 +3,44 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-const NEURON_COUNT: u32 = 448_576;
+// OPTIMIZATION: Reduced neuron count and retina size
+// 160*160 = 25,600 Retina neurons
+// 200,000 - 25,600 = 174,400 Cortex neurons
+const NEURON_COUNT: u32 = 200_000;
 const GRID_DIM: u32 = 128;
-const EXPLICIT_SLOTS: usize = 32;
+// OPTIMIZATION: Reduced explicit slots per neuron from 32 -> 16
+const EXPLICIT_SLOTS: usize = 16;
 
 // --- GPU STRUCTS ---
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Neuron {
-    // BLOCK 1: Geometric (16 bytes)
-    pub concept_pos: [f32; 4], // x, y, z, padding
+    // BLOCK 1 (16 bytes)
+    pub concept_pos: [f32; 4],
 
-    // BLOCK 2: Receptive (16 bytes)
-    pub receptive_center: [f32; 4], // x, y, z, padding
-
-    // BLOCK 3: Identity & Scale (16 bytes)
-    pub layer: u32,
-    pub receptive_scale: f32,
+    // BLOCK 2 (16 bytes)
     pub cortical_pos: [f32; 2],
-
-    // BLOCK 4: Coord & Pad (16 bytes)
     pub retinal_coord: [u32; 2],
-    pub _pad0: [f32; 2],
 
-    // EXPLICIT SYNAPSES (Aligned arrays)
+    // BLOCK 3 (16 bytes)
+    pub layer: u32,
+    pub voltage: f32,
+    pub plasticity_trace: f32,
+    pub learning_rate: f32,
+
+    // BLOCK 4 (16 bytes)
+    pub surprise_accumulator: f32,
+    pub top_geometric_contrib: f32,
+    pub top_geometric_source: u32,
+    pub _pad0: f32,
+
+    // EXPLICIT SYNAPSES (Aligned 16-byte boundaries)
+    // Fixed 16 slots = 16 * 4 = 64 bytes per array
     pub explicit_targets: [u32; EXPLICIT_SLOTS],
     pub explicit_weights: [f32; EXPLICIT_SLOTS],
     pub explicit_ages: [f32; EXPLICIT_SLOTS],
     pub explicit_visual_weights: [f32; EXPLICIT_SLOTS],
-
-    // PLASTICITY & STATE
-    // BLOCK 5: Learning (16 bytes)
-    pub learning_rate: f32,
-    pub homeostatic_target: f32,
-    pub plasticity_trace: f32,
-    pub surprise_accumulator: f32,
-
-    // BLOCK 6: Electrical (16 bytes)
-    pub voltage: f32,
-    pub spike_time: f32,
-    pub refractory_period: f32,
-    pub top_geometric_contrib: f32,
-
-    // BLOCK 7: Source & Pad (16 bytes)
-    pub top_geometric_source: u32,
-    // FIX: Exploded padding to scalars to prevent vec3 alignment gaps
-    pub _pad_end_0: f32,
-    pub _pad_end_1: f32,
-    pub _pad_end_2: f32,
 }
 
 #[repr(C)]
@@ -88,9 +77,8 @@ pub struct SimParams {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct LineVertex {
-    // FIX: Using vec4 (16 bytes) to guarantee alignment
-    pos: [f32; 4],   // xyz + pad
-    color: [f32; 4], // rgb + pad
+    pos: [f32; 4],
+    color: [f32; 4],
 }
 
 pub struct BrainSystem {
@@ -127,7 +115,7 @@ pub struct BrainSystem {
     populate_grid_pipeline: wgpu::ComputePipeline,
     update_neurons_pipeline: wgpu::ComputePipeline,
     generate_lines_pipeline: wgpu::ComputePipeline,
-    clear_cortex_pipeline: wgpu::ComputePipeline, // Renamed from render_cortex_pipeline
+    clear_cortex_pipeline: wgpu::ComputePipeline,
     render_dream_pipeline: wgpu::ComputePipeline,
 
     render_pipeline_points: wgpu::RenderPipeline,
@@ -154,25 +142,25 @@ impl BrainSystem {
             neuron_count: NEURON_COUNT,
             time: 0.0,
             dt: 0.016,
-            geometric_sample_count: 64,
+            geometric_sample_count: 16, // Reduced from 64
             explicit_synapse_slots: EXPLICIT_SLOTS as u32,
             train_mode: 1,
             terror_threshold: 0.5,
             grid_dim: GRID_DIM,
             use_camera: 1,
-            _pad: [0.0; 7], // FIX: Updated to 7 elements
+            _pad: [0.0; 7],
         };
 
         let kernel = SynapticKernel {
-            local_amplitude: 2.5, // Boosted from 1.5
-            local_decay: 0.05,    // Slower decay
+            local_amplitude: 2.5,
+            local_decay: 0.05,
             conceptual_amplitude: 1.2,
             conceptual_decay: 1.5,
             inhibit_radius: 0.15,
             inhibit_strength: 0.8,
-            explicit_learning_rate: 0.15, // Faster learning
+            explicit_learning_rate: 0.15,
             pruning_threshold: 5.0,
-            promotion_threshold: 0.3, // Lower threshold to encourage connection formation
+            promotion_threshold: 0.3,
             temporal_decay: 0.01,
             _pad: [0.0; 2],
         };
@@ -208,7 +196,7 @@ impl BrainSystem {
             mapped_at_creation: false,
         });
 
-        let spike_history_len = NEURON_COUNT * 10;
+        let spike_history_len = NEURON_COUNT * 4; // Reduced history
         let spike_history_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Spike History"),
             size: (spike_history_len as usize * 4) as u64,
@@ -256,7 +244,7 @@ impl BrainSystem {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float, // <--- CHANGED from Rgba8Unorm
+            format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
@@ -678,19 +666,13 @@ impl BrainSystem {
         // Update Camera Input ONLY if active
         if self.params.use_camera == 1 {
             if let Some(img) = self.camera.get_frame() {
-                // 1. Resize (returns ImageBuffer<Rgba<u8>, Vec<u8>>)
                 let img_resized =
                     image::imageops::resize(&img, 512, 512, image::imageops::FilterType::Nearest);
-
-                // 2. Manual Conversion: u8 [0..255] -> f32 [0.0..1.0]
-                // This creates a standard Vec<f32> which works perfectly with bytemuck
                 let raw_f32: Vec<f32> = img_resized
                     .as_raw()
                     .iter()
                     .map(|&b| b as f32 / 255.0)
                     .collect();
-
-                // 3. Cast slice for WGPU
                 let raw_bytes = bytemuck::cast_slice(&raw_f32);
 
                 self.queue.write_texture(
@@ -703,7 +685,7 @@ impl BrainSystem {
                     raw_bytes,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(16 * 512), // 4 floats * 4 bytes * 512 width
+                        bytes_per_row: Some(16 * 512),
                         rows_per_image: Some(512),
                     },
                     wgpu::Extent3d {

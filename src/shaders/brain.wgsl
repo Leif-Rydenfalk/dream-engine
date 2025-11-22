@@ -1,38 +1,31 @@
 // --- STRUCTS ---
 
 struct Neuron {
-    // 16-byte aligned blocks
-    concept_pos: vec4<f32>,          
-    receptive_center: vec4<f32>,     
+    // Block 1 (16 bytes)
+    concept_pos: vec4<f32>,
     
-    layer: u32,                      
-    receptive_scale: f32,
-    cortical_pos: vec2<f32>,         
+    // Block 2 (16 bytes)
+    cortical_pos: vec2<f32>,
+    retinal_coord: vec2<u32>,
     
-    retinal_coord: vec2<u32>,        
-    pad0: vec2<f32>,
-
-    // Explicit Synapses
-    explicit_targets: array<u32, 32>, 
-    explicit_weights: array<f32, 32>,   
-    explicit_ages: array<f32, 32>,
-    explicit_visual_weights: array<f32, 32>,      
-    
-    // Learning & State
+    // Block 3 (16 bytes)
+    layer: u32,
+    voltage: f32,
+    plasticity_trace: f32,
     learning_rate: f32,
-    homeostatic_target: f32,
-    plasticity_trace: f32,           
-    surprise_accumulator: f32,       
-    
-    voltage: f32,                    
-    spike_time: f32,
-    refractory_period: f32,
-    top_geometric_contrib: f32,      
-    
-    top_geometric_source: u32,  
-    pad_end_0: f32,
-    pad_end_1: f32,
-    pad_end_2: f32,
+
+    // Block 4 (16 bytes)
+    surprise_accumulator: f32,
+    top_geometric_contrib: f32,
+    top_geometric_source: u32,
+    pad0: f32,
+
+    // Explicit Synapses (Fixed 16 slots for cache alignment)
+    // 16 * 4 bytes = 64 bytes each array
+    explicit_targets: array<u32, 16>,
+    explicit_weights: array<f32, 16>,
+    explicit_ages: array<f32, 16>,
+    explicit_visual_weights: array<f32, 16>,
 };
 
 struct SynapticKernel {
@@ -114,7 +107,8 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     var n: Neuron;
     let seed = idx * 1000u;
     
-    let retina_dim = 320u;
+    // Reduced Retina Dim for optimization (160x160 = 25,600 neurons)
+    let retina_dim = 160u;
     let retina_count = retina_dim * retina_dim; 
     
     if (idx < retina_count) {
@@ -135,22 +129,17 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         n.learning_rate = 0.1;
     }
 
-    n.receptive_center = vec4<f32>(rand(seed + 20u), rand(seed + 21u), rand(seed + 22u), 0.0) * 2.0 - 1.0;
-    n.receptive_scale = 0.5 + rand(seed + 30u) * 0.5;
-    
-    for (var i = 0; i < 32; i++) {
+    // Reduced explicit slots to 16
+    for (var i = 0; i < 16; i++) {
         n.explicit_targets[i] = 0xFFFFFFFFu;
         n.explicit_weights[i] = 0.0;
         n.explicit_visual_weights[i] = 0.0;
         n.explicit_ages[i] = 0.0;
     }
     
-    n.homeostatic_target = 0.2;
     n.voltage = 0.0;
     n.plasticity_trace = 0.0;
     n.surprise_accumulator = 0.0;
-    n.spike_time = 0.0;
-    n.refractory_period = 0.05;
     n.top_geometric_contrib = 0.0;
     n.top_geometric_source = 0xFFFFFFFFu;
     
@@ -185,75 +174,56 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     if (post_idx >= params.neuron_count) { return; }
     
     var post = neurons[post_idx];
+    let retina_dim = 160u; // Matches Init
 
     // ========================================
-    // LAYER 0: RETINA - Compute Prediction Error
+    // LAYER 0: RETINA
     // ========================================
     if (post.layer == 0u) {
-        
-        // 1. Normalize retina coordinate (0..320) to UV space (0..1)
-        var uv = vec2<f32>(post.retinal_coord) / 320.0;
+        let uv = vec2<f32>(post.retinal_coord) / f32(retina_dim);
         
         var reality = 0.0;
-
         if (params.use_camera == 1u) {
-            // CAMERA MODE: 
-            // Map UV (0..1) to Texture Size (512) explicitly
-            // We use textureSampleLevel to get smooth interpolation
             reality = textureSampleLevel(input_tex, input_sampler, uv, 0.0).r;
         } else {
-            // DREAM MODE:
-            // 1. Apply a slight "Zoom Out" (scale > 1.0) to counteract feedback loop expansion
-            // 2. Add a gentle drift so the dream moves around
             let zoom_out = 1.02; 
             let drift = vec2<f32>(sin(params.time * 0.5), cos(params.time * 0.4)) * 0.02;
-            
-            // Center the UVs, Scale, then Un-center
             let dream_uv = (uv - 0.5) * zoom_out + 0.5 + drift;
-
             reality = textureSampleLevel(input_tex, input_sampler, dream_uv, 0.0).r;
-
-            // Add noise to keep the hallucination active
-            let noise = rand(post_idx + u32(params.time * 100.0)) - 0.5;
-            reality += noise * 0.05;
+            reality += (rand(post_idx + u32(params.time * 100.0)) - 0.5) * 0.05;
         }
         
         let reality_val = (reality - 0.5) * 3.0; 
 
-        // Compute prediction from cortex (top-down)
+        // Simplified prediction sampling (fewer samples for perf)
         var prediction_sum = 0.0;
         var prediction_count = 0.0;
         
-        let dream_samples = 12u; 
-        for (var i = 0u; i < dream_samples; i++) {
+        // Reduced from 12 to 4 samples
+        for (var i = 0u; i < 4u; i++) {
             let offset = rand_vec3_stable(post_idx * 50u + i, params.time) * 0.15;
             let probe_pos = vec3<f32>(post.cortical_pos, 0.0) + offset;
-            
             let grid_idx = hash_to_grid(probe_pos);
             let pre_idx = atomicLoad(&spatial_grid[grid_idx]);
             
             if (pre_idx != 0xFFFFFFFFu && pre_idx < params.neuron_count) {
                 let pre = neurons[pre_idx];
                 if (pre.layer == 1u) {
-                    let dist = distance(vec3<f32>(post.cortical_pos, 0.0), pre.concept_pos.xyz);
-                    let weight = exp(-dist * dist * 20.0);
+                    // Manually compute distance squared to avoid sqrt
+                    let d = vec3<f32>(post.cortical_pos, 0.0) - pre.concept_pos.xyz;
+                    let dist_sq = dot(d, d);
+                    let weight = exp(-dist_sq * 20.0);
                     prediction_sum += pre.plasticity_trace * weight;
                     prediction_count += weight;
                 }
             }
         }
         
-        var prediction = 0.0;
-        if (prediction_count > 0.001) {
-            prediction = prediction_sum / prediction_count;
-        }
-        
-        // Compute prediction error
+        let prediction = select(0.0, prediction_sum / prediction_count, prediction_count > 0.001);
         let error = reality_val - prediction;
         
-        // Store both reality and error
-        post.plasticity_trace = reality_val;  // Actual input
-        post.voltage = error * 5.0;           // Amplified error for learning
+        post.plasticity_trace = reality_val;
+        post.voltage = error * 5.0;
         post.surprise_accumulator = mix(post.surprise_accumulator, abs(error), 0.1);
         
         neurons[post_idx] = post;
@@ -261,13 +231,13 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // ========================================
-    // LAYER 1: CORTEX - Learn Visual Features
+    // LAYER 1: CORTEX
     // ========================================
     var input_signal = 0.0;
     var input_error = 0.0;
 
-    // Process explicit synapses (learned connections)
-    for (var i = 0; i < 32; i++) {
+    // OPTIMIZATION: Hardcoded 16 loop for compiler unrolling
+    for (var i = 0; i < 16; i++) {
         let pre_idx = post.explicit_targets[i];
         if (pre_idx == 0xFFFFFFFFu) { continue; }
         
@@ -281,40 +251,39 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         post.explicit_visual_weights[i] += (target_vis - post.explicit_visual_weights[i]) * 0.1;
     }
 
-    // Sample from retina layer to learn visual features
-    let local_samples = params.geometric_sample_count;
+    // OPTIMIZATION: Structured Tiled Sampling (No random memory thrashing)
     var best_activation = 0.0;
     var best_source = 0xFFFFFFFFu;
     
-    for (var i = 0u; i < local_samples; i++) {
-        // Sample in XY space near this cortex neuron's position
-        let xy_offset = rand_vec3_stable(post_idx * 200u + i, params.time).xy * 0.3;
-        let sample_pos_2d = post.cortical_pos + xy_offset;
+    // 4x4 Grid Sample = 16 reads (down from 64 random reads)
+    for (var i = 0u; i < 16u; i++) {
+        let tile_x = i % 4u;
+        let tile_y = i / 4u;
+        let offset = vec2<f32>(f32(tile_x) - 1.5, f32(tile_y) - 1.5) * 0.05; // Tiling
         
-        // Map to retina coordinates (320x320 grid)
-        let retina_u = (sample_pos_2d.x + 1.0) * 0.5; // -1..1 -> 0..1
+        let sample_pos_2d = post.cortical_pos + offset;
+        
+        let retina_u = (sample_pos_2d.x + 1.0) * 0.5;
         let retina_v = (sample_pos_2d.y + 1.0) * 0.5;
         
         if (retina_u >= 0.0 && retina_u < 1.0 && retina_v >= 0.0 && retina_v < 1.0) {
-            let retina_x = u32(retina_u * 320.0);
-            let retina_y = u32(retina_v * 320.0);
-            let pre_idx = retina_x + retina_y * 320u;
+            let rx = u32(retina_u * 160.0); // 160.0 match retina_dim
+            let ry = u32(retina_v * 160.0);
+            let pre_idx = rx + ry * 160u;
             
-            if (pre_idx < 102400u) { // 320*320 = retina size
+            if (pre_idx < 25600u) { // 160*160
                 let pre = neurons[pre_idx];
                 
-                // Distance in cortical space
-                let cortical_dist = distance(sample_pos_2d, pre.cortical_pos);
-                let weight = exp(-cortical_dist * cortical_dist * 20.0);
+                let d = sample_pos_2d - pre.cortical_pos;
+                let dist_sq = dot(d, d);
+                let weight = exp(-dist_sq * 20.0);
                 
-                // Learn from actual visual input (trace) AND error signal (voltage)
                 let visual_input = pre.plasticity_trace * weight;
                 let error_signal = pre.voltage * weight;
                 
                 input_signal += visual_input;
                 input_error += error_signal;
                 
-                // Track strongest connection for potential promotion
                 let activation = abs(visual_input) * weight;
                 if (activation > best_activation) {
                     best_activation = activation;
@@ -324,34 +293,29 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
-    // Store top geometric connection info
     post.top_geometric_contrib = best_activation;
     post.top_geometric_source = best_source;
 
-    // Update neuron state with strong dynamics
     post.voltage *= 0.90;
     post.voltage += (input_signal + input_error * 0.5) * params.dt * 10.0;
     post.voltage = clamp(post.voltage, -3.0, 3.0);
     post.plasticity_trace += (post.voltage - post.plasticity_trace) * 0.2;
     
     // ========================================
-    // LEARNING: Hebbian + Promotion
+    // LEARNING
     // ========================================
     if (params.train_mode == 1u) {
         let learning_rate = post.learning_rate * kernel.explicit_learning_rate;
         
-        // Hebbian learning on explicit synapses
-        for (var i = 0; i < 32; i++) {
+        for (var i = 0; i < 16; i++) {
             let pre_idx = post.explicit_targets[i];
             if (pre_idx == 0xFFFFFFFFu) { continue; }
             let pre = neurons[pre_idx];
             
-            // Correlate post activity with pre activity
             let delta = post.voltage * pre.plasticity_trace; 
             post.explicit_weights[i] += delta * learning_rate;
             post.explicit_weights[i] *= 0.9995;
             
-            // Prune weak old connections
             if (post.explicit_ages[i] > kernel.pruning_threshold) {
                  if (abs(post.explicit_weights[i]) < 0.05) {
                      post.explicit_targets[i] = 0xFFFFFFFFu;
@@ -360,13 +324,12 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
         
-        // PROMOTE: Create new explicit synapses from strong geometric connections
         if (best_activation > kernel.promotion_threshold && best_source != 0xFFFFFFFFu) {
             var weakest_idx = 0;
             var weakest_strength = abs(post.explicit_weights[0]);
             var found_empty = false;
             
-            for (var i = 0; i < 32; i++) {
+            for (var i = 0; i < 16; i++) {
                 if (post.explicit_targets[i] == 0xFFFFFFFFu) {
                     weakest_idx = i;
                     found_empty = true;
@@ -390,8 +353,8 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     post.surprise_accumulator = mix(post.surprise_accumulator, abs(input_signal + input_error), 0.05);
     neurons[post_idx] = post;
     
-    // Write directly to cortex visualization texture (single pixel, no splat)
-    let cortex_uv = (post.cortical_pos + 1.0) * 0.5; // -1..1 -> 0..1
+    // Write to texture (1 pixel)
+    let cortex_uv = (post.cortical_pos + 1.0) * 0.5;
     let tex_x = i32(cortex_uv.x * 512.0);
     let tex_y = i32(cortex_uv.y * 512.0);
     
@@ -399,8 +362,6 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         let activity = post.voltage;
         let hot = vec3<f32>(1.0, 0.5, 0.0) * max(0.0, activity * 0.5);
         let cold = vec3<f32>(0.0, 0.3, 1.0) * max(0.0, -activity * 0.5);
-        
-        // Single pixel write - let GPU blend naturally
         let col = vec4<f32>(hot + cold, 1.0);
         textureStore(output_tex, vec2<i32>(tex_x, tex_y), col);
     }
@@ -412,10 +373,10 @@ fn cs_generate_lines(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= params.neuron_count) { return; }
     
     let neuron = neurons[idx];
-    let start_offset = idx * params.explicit_synapse_slots * 2u;
+    let start_offset = idx * 16u * 2u; // 16 slots
     let origin = neuron.concept_pos.xyz * 3.0; 
     
-    for (var i = 0u; i < params.explicit_synapse_slots; i++) {
+    for (var i = 0u; i < 16u; i++) {
         let target_idx = neuron.explicit_targets[i];
         let vis_weight = neuron.explicit_visual_weights[i]; 
         let buffer_idx = start_offset + i * 2u;
@@ -423,10 +384,8 @@ fn cs_generate_lines(@builtin(global_invocation_id) id: vec3<u32>) {
         if (target_idx != 0xFFFFFFFFu && target_idx < params.neuron_count && vis_weight > 0.01) {
             let target_neuron = neurons[target_idx];
             let dest = target_neuron.concept_pos.xyz * 3.0;
-            
             let weight = neuron.explicit_weights[i];
             
-            // Excitatory (Cyan) vs Inhibitory (Red)
             var col = select(vec3<f32>(1.0, 0.1, 0.1), vec3<f32>(0.0, 0.9, 1.0), weight > 0.0);
             let alpha = clamp(vis_weight * 2.0, 0.0, 0.6);
 
@@ -451,15 +410,15 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= dim.x || id.y >= dim.y) { return; }
     
     let uv = vec2<f32>(id.xy) / vec2<f32>(dim);
-    let retinal_x = u32(uv.x * 320.0);
-    let retinal_y = u32(uv.y * 320.0);
-    let idx = retinal_x + retinal_y * 320u;
+    // Matches new retina dim 160
+    let retinal_x = u32(uv.x * 160.0);
+    let retinal_y = u32(uv.y * 160.0);
+    let idx = retinal_x + retinal_y * 160u;
     
     var color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     
     if (idx < params.neuron_count) {
         let n = neurons[idx];
-        // Show what cortex predicts this pixel should be
         let pred = n.plasticity_trace * 0.5 + 0.5; 
         color = vec4<f32>(pred, pred, pred, 1.0);
     }
@@ -468,19 +427,9 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(8, 8)
-fn cs_render_cortex(@builtin(global_invocation_id) id: vec3<u32>) {
-    let dim = vec2<u32>(512, 512);
-    if (id.x >= dim.x || id.y >= dim.y) { return; }
-    
-    // Clear to black - neurons will write during their update pass
-    textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
-}
-
-@compute @workgroup_size(8, 8)
 fn cs_clear_cortex(@builtin(global_invocation_id) id: vec3<u32>) {
     let dim = vec2<u32>(512, 512);
     if (id.x >= dim.x || id.y >= dim.y) { return; }
-    
     textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
 }
 
@@ -515,20 +464,17 @@ fn vs_main(
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     
     var base_color = vec3<f32>(0.1);
-    var alpha = 1.0;
     
     if (neuron.layer == 0u) { 
-        // Retina: Show prediction error
         let err = neuron.voltage * 0.1; 
         base_color = vec3<f32>(0.1) + vec3<f32>(max(0.0, err), 0.0, max(0.0, -err));
     } 
     else if (neuron.layer == 1u) { 
-        // Cortex: Show activity
         let act = neuron.voltage * 0.3;
         base_color = vec3<f32>(max(0.0, act), max(0.0, act*0.5), abs(neuron.plasticity_trace)*0.3);
     }
 
-    out.color = vec4<f32>(base_color, alpha);
+    out.color = vec4<f32>(base_color, 1.0);
     return out;
 }
 
