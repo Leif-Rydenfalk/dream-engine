@@ -390,22 +390,25 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
     let grid_dim = f32(params.grid_dim);
     let center_u = uv.x * grid_dim;
     let center_v = uv.y * grid_dim;
+
+    let layer_stride = params.grid_dim * params.grid_dim;
+    let l6_offset = 6u * layer_stride; // Look at Layer 6
     
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
-             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
-             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-             let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim]);
+            let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+            let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+            let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + l6_offset]);
              
-             if (idx != 0xFFFFFFFFu) {
-                 let n = neurons[idx];
-                 if (n.layer == 6u) {
-                     let d = distance(pos, n.pos);
-                     let w = exp(-d * 50.0); // Smooth reconstruction kernel
-                     val += n.voltage * w;
-                     w_sum += w;
-                 }
-             }
+            if (idx != 0xFFFFFFFFu) {
+                let n = neurons[idx];
+                if (n.layer == 6u) {
+                    let d = distance(pos, n.pos);
+                    let w = exp(-d * 50.0); // Smooth reconstruction kernel
+                    val += n.voltage * w;
+                    w_sum += w;
+                }
+            }
         }
     }
     
@@ -429,29 +432,32 @@ fn cs_render_error(@builtin(global_invocation_id) id: vec3<u32>) {
     let grid_dim = f32(params.grid_dim);
     let center_u = uv.x * grid_dim;
     let center_v = uv.y * grid_dim;
+
+    let layer_stride = params.grid_dim * params.grid_dim;
+    let l0_offset = 0u; 
     
     // Small kernel search to reconstruct the image from neurons
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
-             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
-             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-             
-             let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim]);
-             
-             if (idx != 0xFFFFFFFFu) {
-                 let n = neurons[idx];
-                 // WE WANT LAYER 0 (Retina/Error Layer)
-                 if (n.layer == 0u) {
-                     let d = distance(pos, n.pos);
-                     // L0 is dense, so we use a tight kernel
-                     let w = exp(-d * 100.0); 
-                     
-                     // Voltage in L0 = (Reality - Prediction)
-                     // We visualize the absolute error
-                     error_accum += n.voltage * w;
-                     w_sum += w;
-                 }
-             }
+            let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+            let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+            
+            let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + l0_offset]);
+            
+            if (idx != 0xFFFFFFFFu) {
+                let n = neurons[idx];
+                // WE WANT LAYER 0 (Retina/Error Layer)
+                if (n.layer == 0u) {
+                    let d = distance(pos, n.pos);
+                    // L0 is dense, so we use a tight kernel
+                    let w = exp(-d * 100.0); 
+                    
+                    // Voltage in L0 = (Reality - Prediction)
+                    // We visualize the absolute error
+                    error_accum += n.voltage * w;
+                    w_sum += w;
+                }
+            }
         }
     }
     
