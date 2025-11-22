@@ -3,60 +3,29 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-// OPTIMIZATION: Reduced neuron count and retina size
-// 160*160 = 25,600 Retina neurons
-// 200,000 - 25,600 = 174,400 Cortex neurons
 const NEURON_COUNT: u32 = 200_000;
 const GRID_DIM: u32 = 128;
-// OPTIMIZATION: Reduced explicit slots per neuron from 32 -> 16
-const EXPLICIT_SLOTS: usize = 16;
 
-// --- GPU STRUCTS ---
+// --- GPU STRUCTS (Architecture Updated) ---
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Neuron {
-    // BLOCK 1 (16 bytes)
-    pub concept_pos: [f32; 4],
+    // 16 Bytes: 128-bit Semantic Hypervector (SDR Identity)
+    pub semantic: [u32; 4],
 
-    // BLOCK 2 (16 bytes)
-    pub cortical_pos: [f32; 2],
-    pub retinal_coord: [u32; 2],
+    // 8 Bytes: Position
+    pub pos: [f32; 2],
 
-    // BLOCK 3 (16 bytes)
+    // 16 Bytes: Predictive Coding State
+    pub voltage: f32,    // Error/Activity
+    pub prediction: f32, // Mu
+    pub precision: f32,  // Sigma
     pub layer: u32,
-    pub voltage: f32,
-    pub plasticity_trace: f32,
-    pub learning_rate: f32,
 
-    // BLOCK 4 (16 bytes)
-    pub surprise_accumulator: f32,
-    pub top_geometric_contrib: f32,
-    pub top_geometric_source: u32,
+    // 8 Bytes: Padding to reach 48-byte alignment/struct size
     pub _pad0: f32,
-
-    // EXPLICIT SYNAPSES (Aligned 16-byte boundaries)
-    // Fixed 16 slots = 16 * 4 = 64 bytes per array
-    pub explicit_targets: [u32; EXPLICIT_SLOTS],
-    pub explicit_weights: [f32; EXPLICIT_SLOTS],
-    pub explicit_ages: [f32; EXPLICIT_SLOTS],
-    pub explicit_visual_weights: [f32; EXPLICIT_SLOTS],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct SynapticKernel {
-    pub local_amplitude: f32,
-    pub local_decay: f32,
-    pub conceptual_amplitude: f32,
-    pub conceptual_decay: f32,
-    pub inhibit_radius: f32,
-    pub inhibit_strength: f32,
-    pub explicit_learning_rate: f32,
-    pub pruning_threshold: f32,
-    pub promotion_threshold: f32,
-    pub temporal_decay: f32,
-    pub _pad: [f32; 2],
+    pub _pad1: f32,
 }
 
 #[repr(C)]
@@ -65,13 +34,11 @@ pub struct SimParams {
     pub neuron_count: u32,
     pub time: f32,
     pub dt: f32,
-    pub geometric_sample_count: u32,
-    pub explicit_synapse_slots: u32,
-    pub train_mode: u32,
-    pub terror_threshold: f32,
     pub grid_dim: u32,
+    pub train_mode: u32,
     pub use_camera: u32,
-    pub _pad: [f32; 7],
+    pub _pad0: f32,
+    pub _pad1: f32,
 }
 
 #[repr(C)]
@@ -87,10 +54,8 @@ pub struct BrainSystem {
     // Buffers
     neuron_buffer: wgpu::Buffer,
     param_buffer: wgpu::Buffer,
-    kernel_buffer: wgpu::Buffer,
     spatial_grid_buffer: wgpu::Buffer,
-    spike_history_buffer: wgpu::Buffer,
-    synapse_line_buffer: wgpu::Buffer,
+    line_buffer: wgpu::Buffer,
     vertex_buffer_cube: wgpu::Buffer,
     index_buffer_cube: wgpu::Buffer,
 
@@ -123,7 +88,6 @@ pub struct BrainSystem {
 
     // State
     pub params: SimParams,
-    pub kernel: SynapticKernel,
     start_time: std::time::Instant,
     initialized: bool,
 }
@@ -142,30 +106,14 @@ impl BrainSystem {
             neuron_count: NEURON_COUNT,
             time: 0.0,
             dt: 0.016,
-            geometric_sample_count: 16, // Reduced from 64
-            explicit_synapse_slots: EXPLICIT_SLOTS as u32,
-            train_mode: 1,
-            terror_threshold: 0.5,
             grid_dim: GRID_DIM,
+            train_mode: 1,
             use_camera: 1,
-            _pad: [0.0; 7],
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
 
-        let kernel = SynapticKernel {
-            local_amplitude: 2.5,
-            local_decay: 0.05,
-            conceptual_amplitude: 1.2,
-            conceptual_decay: 1.5,
-            inhibit_radius: 0.15,
-            inhibit_strength: 0.8,
-            explicit_learning_rate: 0.15,
-            pruning_threshold: 5.0,
-            promotion_threshold: 0.3,
-            temporal_decay: 0.01,
-            _pad: [0.0; 2],
-        };
-
-        // 2. Create Buffers
+        // 2. Create Buffers (Optimized Sizes)
         let neuron_buffer_size = (std::mem::size_of::<Neuron>() * NEURON_COUNT as usize) as u64;
         let neuron_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Neuron Buffer"),
@@ -182,13 +130,9 @@ impl BrainSystem {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let kernel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Synaptic Kernel"),
-            contents: bytemuck::cast_slice(&[kernel]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        // Note: Kernel buffer removed as VSA logic is intrinsic
 
-        let grid_len = GRID_DIM * GRID_DIM * GRID_DIM;
+        let grid_len = GRID_DIM * GRID_DIM; // 2D Grid now (hash_to_grid uses 2D)
         let spatial_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Spatial Grid"),
             size: (grid_len as usize * 4) as u64,
@@ -196,18 +140,11 @@ impl BrainSystem {
             mapped_at_creation: false,
         });
 
-        let spike_history_len = NEURON_COUNT * 4; // Reduced history
-        let spike_history_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Spike History"),
-            size: (spike_history_len as usize * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let max_lines = NEURON_COUNT as usize * EXPLICIT_SLOTS;
-        let line_buffer_size = (max_lines * std::mem::size_of::<LineVertex>() * 2) as u64;
-        let synapse_line_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Synapse Lines"),
+        // Line buffer for visualization (1 line per neuron max now)
+        let line_buffer_size =
+            (NEURON_COUNT as usize * 2 * std::mem::size_of::<LineVertex>()) as u64;
+        let line_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Line Buffer"),
             size: line_buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
             mapped_at_creation: false,
@@ -313,11 +250,12 @@ impl BrainSystem {
                     },
                     count: None,
                 },
+                // Kernel removed
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -336,26 +274,6 @@ impl BrainSystem {
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -364,13 +282,13 @@ impl BrainSystem {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 7,
+                    binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 8,
+                    binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
@@ -380,7 +298,7 @@ impl BrainSystem {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 9,
+                    binding: 7,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
@@ -406,34 +324,26 @@ impl BrainSystem {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: kernel_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
                     resource: spatial_grid_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: line_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: spike_history_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: synapse_line_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
                     resource: wgpu::BindingResource::TextureView(&input_texture_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 7,
+                    binding: 5,
                     resource: wgpu::BindingResource::Sampler(&input_sampler),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 8,
+                    binding: 6,
                     resource: wgpu::BindingResource::TextureView(&output_texture_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 9,
+                    binding: 7,
                     resource: wgpu::BindingResource::TextureView(&prediction_texture_view),
                 },
             ],
@@ -610,10 +520,8 @@ impl BrainSystem {
             queue,
             neuron_buffer,
             param_buffer,
-            kernel_buffer,
             spatial_grid_buffer,
-            spike_history_buffer,
-            synapse_line_buffer,
+            line_buffer,
             vertex_buffer_cube,
             index_buffer_cube,
             input_texture,
@@ -636,7 +544,6 @@ impl BrainSystem {
             render_pipeline_points,
             render_pipeline_lines,
             params,
-            kernel,
             start_time: std::time::Instant::now(),
             initialized: false,
         }
@@ -645,12 +552,10 @@ impl BrainSystem {
     pub fn update(&mut self, input: &crate::input::Input, _window_size: (u32, u32)) {
         self.params.time = self.start_time.elapsed().as_secs_f32();
 
-        // Toggle Train Mode (Space)
         if input.is_key_pressed(winit::keyboard::KeyCode::Space) {
             self.params.train_mode = if self.params.train_mode == 1 { 0 } else { 1 };
         }
 
-        // Toggle Dream Mode (D)
         if input.is_key_pressed(winit::keyboard::KeyCode::KeyD) {
             self.params.use_camera = if self.params.use_camera == 1 { 0 } else { 1 };
             println!(
@@ -663,7 +568,6 @@ impl BrainSystem {
             );
         }
 
-        // Update Camera Input ONLY if active
         if self.params.use_camera == 1 {
             if let Some(img) = self.camera.get_frame() {
                 let img_resized =
@@ -699,8 +603,6 @@ impl BrainSystem {
 
         self.queue
             .write_buffer(&self.param_buffer, 0, bytemuck::cast_slice(&[self.params]));
-        self.queue
-            .write_buffer(&self.kernel_buffer, 0, bytemuck::cast_slice(&[self.kernel]));
     }
 
     pub fn render(
@@ -710,7 +612,6 @@ impl BrainSystem {
         depth_view: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
-        // DREAM MODE: Feed Prediction back into Input
         if self.params.use_camera == 0 {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -751,7 +652,7 @@ impl BrainSystem {
             // 1. Clear Grid
             cpass.set_pipeline(&self.clear_grid_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let grid_len = GRID_DIM * GRID_DIM * GRID_DIM;
+            let grid_len = GRID_DIM * GRID_DIM;
             cpass.dispatch_workgroups((grid_len + 63) / 64, 1, 1);
 
             // 2. Populate Grid
@@ -759,7 +660,7 @@ impl BrainSystem {
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
             cpass.dispatch_workgroups((self.params.neuron_count + 63) / 64, 1, 1);
 
-            // 3. Clear Visualization Textures (BEFORE neurons write to them)
+            // 3. Clear Visualization Textures
             cpass.set_pipeline(&self.clear_cortex_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
             cpass.dispatch_workgroups(512 / 8, 512 / 8, 1);
@@ -768,12 +669,12 @@ impl BrainSystem {
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
             cpass.dispatch_workgroups(512 / 8, 512 / 8, 1);
 
-            // 4. Update Neurons (which write to the cortex texture)
+            // 4. Update Neurons (VSA Binding + PC)
             cpass.set_pipeline(&self.update_neurons_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
             cpass.dispatch_workgroups((self.params.neuron_count + 63) / 64, 1, 1);
 
-            // 5. Generate Lines
+            // 5. Generate Procedural Lines
             if RENDER_3D_VISUALIZATION {
                 cpass.set_pipeline(&self.generate_lines_pipeline);
                 cpass.set_bind_group(0, &self.compute_bind_group, &[]);
@@ -808,9 +709,8 @@ impl BrainSystem {
                 rpass.set_pipeline(&self.render_pipeline_lines);
                 rpass.set_bind_group(0, &self.empty_bind_group, &[]);
                 rpass.set_bind_group(1, camera_bg, &[]);
-                rpass.set_vertex_buffer(0, self.synapse_line_buffer.slice(..));
-                let vertex_count =
-                    self.params.neuron_count * self.params.explicit_synapse_slots * 2;
+                rpass.set_vertex_buffer(0, self.line_buffer.slice(..));
+                let vertex_count = self.params.neuron_count * 2;
                 rpass.draw(0..vertex_count, 0..1);
 
                 rpass.set_pipeline(&self.render_pipeline_points);
