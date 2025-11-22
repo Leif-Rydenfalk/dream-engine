@@ -93,17 +93,34 @@ fn cs_init_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     n.semantic = vec4<u32>(hash(seed), hash(seed+1u), hash(seed+2u), hash(seed+3u));
     n.voltage = 0.0;
     n.prediction = 0.0;
-    n.fatigue = 1.0;  // Boost starts at 1.0
+    n.fatigue = 1.0;
     n.boredom = 0.0;
     
-    // UNIFORM COLUMNAR LAYERING
-    // All layers are equal size - no hourglass!
-    let total = f32(params.neuron_count);
-    let layer_idx = u32((f32(idx) / total) * 7.0);
-    n.layer = clamp(layer_idx, 0u, 6u);
+    // EMERGENT LAYERING: Instead of assigning layers, assign Z-depth continuously
+    // Neurons at Z=-1 will naturally become "input" layer
+    // Neurons at Z=+1 will naturally become "prediction" layer
+    // Middle neurons will self-organize based on connectivity
     
-    // Uniform spatial distribution
-    n.pos = vec2<f32>(rand_f32(seed+4u), rand_f32(seed+5u)) * 2.0 - 1.0;
+    let total = f32(params.neuron_count);
+    let normalized_idx = f32(idx) / total;
+    
+    // Z-depth from -1.0 (input face) to +1.0 (output face)
+    let z_base = normalized_idx * 2.0 - 1.0;
+    
+    // Add some jitter so layers aren't perfectly flat
+    let z_jitter = (rand_f32(seed+7u) - 0.5) * 0.2;
+    let z = clamp(z_base + z_jitter, -1.0, 1.0);
+    
+    // XY position is random across the 2D plane
+    let x = rand_f32(seed+4u) * 2.0 - 1.0;
+    let y = rand_f32(seed+5u) * 2.0 - 1.0;
+    
+    n.pos = vec2<f32>(x, y);
+    
+    // Store Z-depth in layer field (we'll reinterpret it)
+    // Map -1.0...+1.0 to 0...6 for compatibility with grid system
+    n.layer = u32(clamp((z + 1.0) * 3.5, 0.0, 6.0));
+    
     n.precision_value = rand_f32(seed+6u);
 
     neurons[idx] = n;
@@ -146,8 +163,12 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     
     var n = neurons[idx];
     
-    // --- L0: RETINA (INPUT LAYER) ---
-    if (n.layer == 0u) {
+    // Decode Z-depth from layer field
+    let my_depth = (f32(n.layer) / 3.5) - 1.0; // -1.0 to +1.0
+    
+    // --- BOTTOM LAYER: SENSORY INPUT ---
+    // Neurons near Z=-1.0 are input neurons
+    if (my_depth < -0.8) {
         let uv = (n.pos + 1.0) * 0.5;
         var reality = 0.0;
         if (params.use_camera == 1u) {
@@ -156,22 +177,77 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
             reality = (rand_f32(idx + u32(params.time * 60.0)) - 0.5) * 0.1 + 0.5;
         }
         
+        // Sample prediction from TOP layer (Z=+1.0)
         let pred = textureLoad(prediction_tex_read, vec2<i32>(uv * 512.0), 0).r;
         
-        // L0 voltage = Surprise (Error)
-        n.voltage = abs(reality - pred);
+        // Error = Surprise
+        n.voltage = abs(reality - pred) * 2.0; // Amplify for visibility
         n.prediction = reality;
         
         neurons[idx] = n;
         return;
     }
+    
+    // --- TOP LAYER: PREDICTION OUTPUT ---
+    // Neurons near Z=+1.0 are prediction neurons
+    if (my_depth > 0.8) {
+        // Top layer predicts by averaging similar neurons in middle layers
+        var potential = 0.0;
+        var max_sim = 0.0;
+        var best_idx = 0xFFFFFFFFu;
+        var rng = idx * 928374u + u32(params.time * 2.0);
+        
+        let grid_dim = f32(params.grid_dim);
+        let center_u = (n.pos.x + 1.0) * 0.5 * grid_dim;
+        let center_v = (n.pos.y + 1.0) * 0.5 * grid_dim;
+        let stride = params.grid_dim * params.grid_dim;
+        
+        // Sample from middle layers (Z=-0.5 to +0.5)
+        for (var i = 0u; i < 32u; i++) {
+            let target_layer = u32(clamp(rng_next(&rng) * 3.5 + 1.5, 1.0, 5.0)); // Layers 1-5
+            
+            let r_angle = rng_next(&rng) * 6.28318;
+            let r_dist = sqrt(rng_next(&rng)) * 8.0;
+            
+            let gx = u32(clamp(center_u + cos(r_angle) * r_dist, 0.0, grid_dim - 1.0));
+            let gy = u32(clamp(center_v + sin(r_angle) * r_dist, 0.0, grid_dim - 1.0));
+            
+            let target_idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + target_layer * stride]);
+            
+            if (target_idx != 0xFFFFFFFFu) {
+                let src = neurons[target_idx];
+                let sim = hamming_similarity(n.semantic, src.semantic);
+                if (sim > 0.4) {
+                    potential += src.voltage * sim;
+                    
+                    if (sim > max_sim) {
+                        max_sim = sim;
+                        best_idx = target_idx;
+                    }
+                }
+            }
+        }
+        
+        n.voltage = mix(n.voltage, potential / 32.0, 0.2);
+        
+        // TOP LAYER ALSO LEARNS
+        if (params.train_mode == 1u && best_idx != 0xFFFFFFFFu) {
+            let src = neurons[best_idx];
+            let seed_learn = idx + u32(params.time * 500.0);
+            let rnd = vec4<u32>(hash(seed_learn), hash(seed_learn+1u), hash(seed_learn+2u), hash(seed_learn+3u));
+            let mask = rnd & vec4<u32>(0x0F0F0F0Fu);
+            n.semantic = (n.semantic & ~mask) | (src.semantic & mask);
+        }
+        
+        neurons[idx] = n;
+        return;
+    }
 
-    // --- CORTICAL PROCESSING (L1-L6) ---
+    // --- MIDDLE LAYERS: CORTICAL PROCESSING ---
     var potential = 0.0;
     var max_sim = 0.0;
     var best_source_idx = 0xFFFFFFFFu;
     
-    // Initialize RNG for this neuron's dendritic sampling
     var rng = idx * 928374u + u32(params.time * 2.0);
     
     let grid_dim = f32(params.grid_dim);
@@ -179,61 +255,39 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
     let center_v = (n.pos.y + 1.0) * 0.5 * grid_dim;
     let stride = params.grid_dim * params.grid_dim;
     
-    // DENSE CONNECTIVITY: Sample 64 synapses per neuron
+    // DEPTH-BASED CONNECTIVITY
+    // Each neuron samples from a depth range based on its own depth
     let synapse_count = 64u;
     
     for (var i = 0u; i < synapse_count; i++) {
         let rnd_val = rng_next(&rng);
         
-        // --- THE CONNECTOME (Biological Wiring Diagram) ---
-        var target_layer = n.layer;
+        // Sample from layers below (bottom-up) and same layer (lateral)
+        // And occasionally from above (top-down feedback)
+        var target_depth_layer: u32;
         
-        if (n.layer == 1u) {
-            // L1: Apical Feedback Loop
-            // 50% L2 (feedback), 50% L1 (lateral)
-            target_layer = select(1u, 2u, rnd_val > 0.5);
-        } else if (n.layer == 2u) {
-            // L2: Main Processor
-            // 40% L1 (loop), 30% L4 (sensory), 30% L2 (lateral)
-            if (rnd_val < 0.4) {
-                target_layer = 1u;
-            } else if (rnd_val < 0.7) {
-                target_layer = 4u;
-            } else {
-                target_layer = 2u;
-            }
-        } else if (n.layer == 3u) {
-            // L3: Association
-            target_layer = select(3u, 2u, rnd_val > 0.5);
-        } else if (n.layer == 4u) {
-            // L4: Input Receiver
-            // 70% L0 (thalamus), 30% L6 (feedback)
-            target_layer = select(6u, 0u, rnd_val > 0.3);
-        } else if (n.layer == 5u) {
-            // L5: Output
-            // 60% L2/L3, 40% L5
-            target_layer = select(5u, 3u, rnd_val > 0.4);
-        } else if (n.layer == 6u) {
-            // L6: Feedback Generator
-            target_layer = select(6u, 5u, rnd_val > 0.5);
+        if (rnd_val < 0.4) {
+            // 40% bottom-up: sample from layers below
+            target_depth_layer = max(0u, n.layer - 1u);
+        } else if (rnd_val < 0.7) {
+            // 30% lateral: sample from same layer
+            target_depth_layer = n.layer;
+        } else {
+            // 30% top-down: sample from layers above
+            target_depth_layer = min(6u, n.layer + 1u);
         }
         
-        // Dendritic reach (L1 and L6 have longer axons)
-        let reach = select(5.0, 12.0, n.layer == 1u || n.layer == 6u);
-        
-        // Random spatial sampling (uniform disk)
+        let reach = 8.0;
         let r_angle = rng_next(&rng) * 6.28318;
         let r_dist = sqrt(rng_next(&rng)) * reach;
         
         let gx = u32(clamp(center_u + cos(r_angle) * r_dist, 0.0, grid_dim - 1.0));
         let gy = u32(clamp(center_v + sin(r_angle) * r_dist, 0.0, grid_dim - 1.0));
         
-        let target_idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + target_layer * stride]);
+        let target_idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + target_depth_layer * stride]);
         
         if (target_idx != 0xFFFFFFFFu) {
             let src = neurons[target_idx];
-            
-            // Dendritic spike detection (pattern matching)
             let sim = hamming_similarity(n.semantic, src.semantic);
             
             if (sim > 0.4) {
@@ -247,17 +301,15 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
-    // Apply BOOST (Homeostasis)
     potential *= n.fatigue;
     
-    // --- AGGRESSIVE LATERAL INHIBITION (k-Winner-Take-All) ---
-    // Check MORE neighbors over a WIDER area
+    // --- LATERAL INHIBITION ---
     var stronger_neighbors = 0u;
-    let check_count = 32u;  // Increased from 8 to 32
+    let check_count = 32u;
     
     for (var k = 0u; k < check_count; k++) {
         let r_angle = rng_next(&rng) * 6.28;
-        let r_dist = rng_next(&rng) * 25.0;  // Increased from 10.0 to 25.0
+        let r_dist = rng_next(&rng) * 25.0;
         
         let gx = u32(clamp(center_u + cos(r_angle) * r_dist, 0.0, grid_dim - 1.0));
         let gy = u32(clamp(center_v + sin(r_angle) * r_dist, 0.0, grid_dim - 1.0));
@@ -272,36 +324,37 @@ fn cs_update_neurons(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
-    // MUCH STRICTER K-WTA: Only fire if I'm in the top 10%
-    // With 32 checks, if more than 3 neighbors are stronger, I'm not in the top 10%
     var is_active = false;
-    if (stronger_neighbors < 4u && potential > 0.1) {  // Also raised threshold from 0.05 to 0.1
-        n.voltage = mix(n.voltage, 1.0, 0.3);  // Faster rise
+    if (stronger_neighbors < 4u && potential > 0.1) {
+        n.voltage = mix(n.voltage, 1.0, 0.3);
         is_active = true;
     } else {
-        n.voltage = mix(n.voltage, 0.0, 0.5);  // Faster decay
+        n.voltage = mix(n.voltage, 0.0, 0.5);
     }
     
-    // HOMEOSTASIS UPDATE
+    // HOMEOSTASIS
     if (is_active) {
         n.fatigue = max(0.5, n.fatigue - 0.05);
     } else {
         n.fatigue = min(10.0, n.fatigue + 0.001);
     }
     
-    // LEARNING (Hebbian)
+    // LEARNING (Much more aggressive)
     if (is_active && params.train_mode == 1u && best_source_idx != 0xFFFFFFFFu) {
         let src = neurons[best_source_idx];
         let seed_learn = idx + u32(params.time * 500.0);
+        
+        // Learn on EVERY activation, not randomly
+        // Update 4 bits instead of 1
         let rnd = vec4<u32>(hash(seed_learn), hash(seed_learn+1u), hash(seed_learn+2u), hash(seed_learn+3u));
-        let mask = rnd & vec4<u32>(0x01010101u);
+        let mask = rnd & vec4<u32>(0x0F0F0F0Fu); // 4 bits per byte instead of 1
         n.semantic = (n.semantic & ~mask) | (src.semantic & mask);
     }
     
-    // BURSTING (Exploration)
-    if (n.fatigue > 5.0 && params.train_mode == 1u) {
+    // BURSTING (More aggressive exploration)
+    if (n.fatigue > 3.0 && params.train_mode == 1u) {  // Lower threshold from 5.0 to 3.0
         let seed_mut = idx + u32(params.time * 77.0);
-        let mask = vec4<u32>(0x01010101u);
+        let mask = vec4<u32>(0x0F0F0F0Fu);  // Mutate 4 bits instead of 1
         let new_bit = vec4<u32>(hash(seed_mut), hash(seed_mut+1u), hash(seed_mut+2u), hash(seed_mut+3u));
         n.semantic = (n.semantic & ~mask) | (new_bit & mask);
     }
@@ -407,27 +460,36 @@ fn cs_render_dream(@builtin(global_invocation_id) id: vec3<u32>) {
     let center_u = uv.x * grid_dim;
     let center_v = uv.y * grid_dim;
     let layer_stride = params.grid_dim * params.grid_dim;
-    let l6_offset = 6u * layer_stride;
     
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
-            let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-            let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + l6_offset]);
-             
-            if (idx != 0xFFFFFFFFu) {
-                let n = neurons[idx];
-                if (n.layer == 6u) {
-                    let d = distance(pos, n.pos);
-                    let w = exp(-d * 50.0);
-                    val += n.voltage * w;
-                    w_sum += w;
+    // Sample from TOP layer (L6, depth > 0.8)
+    // These are layers 5 and 6 in our depth mapping
+    for (var layer_offset = 5u; layer_offset <= 6u; layer_offset++) {
+        let grid_offset = layer_offset * layer_stride;
+        
+        for (var dy = -2; dy <= 2; dy++) {
+            for (var dx = -2; dx <= 2; dx++) {
+                let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
+                let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
+                let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + grid_offset]);
+                 
+                if (idx != 0xFFFFFFFFu) {
+                    let n = neurons[idx];
+                    let n_depth = (f32(n.layer) / 3.5) - 1.0;
+                    
+                    // Only use top layer neurons
+                    if (n_depth > 0.8) {
+                        let d = distance(pos, n.pos);
+                        let w = exp(-d * 50.0);
+                        val += n.voltage * w;
+                        w_sum += w;
+                    }
                 }
             }
         }
     }
     
-    let final_color = select(0.0, val / w_sum, w_sum > 0.001);
+    // If no neurons found (early in training), default to gray
+    let final_color = select(0.5, val / w_sum, w_sum > 0.001);
     textureStore(prediction_tex, vec2<i32>(id.xy), vec4<f32>(final_color, final_color, final_color, 1.0));
 }
 
@@ -446,19 +508,27 @@ fn cs_render_error(@builtin(global_invocation_id) id: vec3<u32>) {
     let center_u = uv.x * grid_dim;
     let center_v = uv.y * grid_dim;
     let layer_stride = params.grid_dim * params.grid_dim;
-    let l0_offset = 0u;
     
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
+    // Sample from BOTTOM layer (L0, depth < -0.8)
+    // This is layer 0 in our depth mapping
+    let grid_offset = 0u * layer_stride;
+    
+    for (var dy = -2; dy <= 2; dy++) {
+        for (var dx = -2; dx <= 2; dx++) {
             let gx = u32(clamp(center_u + f32(dx), 0.0, grid_dim - 1.0));
             let gy = u32(clamp(center_v + f32(dy), 0.0, grid_dim - 1.0));
-            let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + l0_offset]);
+            let idx = atomicLoad(&spatial_grid[gx + gy * params.grid_dim + grid_offset]);
             
             if (idx != 0xFFFFFFFFu) {
                 let n = neurons[idx];
-                if (n.layer == 0u) {
+                let n_depth = (f32(n.layer) / 3.5) - 1.0;
+                
+                // Only use bottom layer neurons
+                if (n_depth < -0.8) {
                     let d = distance(pos, n.pos);
                     let w = exp(-d * 100.0);
+                    
+                    // n.voltage in L0 contains abs(reality - prediction)
                     error_accum += n.voltage * w;
                     w_sum += w;
                 }
@@ -466,14 +536,11 @@ fn cs_render_error(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
-    let val = select(0.0, error_accum / w_sum, w_sum > 0.0001);
+    let error_val = select(0.0, error_accum / w_sum, w_sum > 0.0001);
     
-    var col = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    if (val > 0.0) {
-        col = vec4<f32>(val * 5.0, 0.0, 0.0, 1.0);
-    } else {
-        col = vec4<f32>(0.0, 0.0, abs(val) * 5.0, 1.0);
-    }
+    // Visualize error magnitude as red intensity
+    // Perfect prediction = black, high error = bright red
+    let col = vec4<f32>(error_val * 2.0, 0.0, 0.0, 1.0);
     
     textureStore(output_tex, vec2<i32>(id.xy), col);
 }
@@ -485,20 +552,28 @@ fn vs_main(@location(0) vertex_pos: vec3<f32>, @builtin(instance_index) idx: u32
     var out: VertexOutput;
     let n = neurons[idx];
     
-    let z_depth = (f32(n.layer) - 3.0) * 0.5;
+    // Decode actual Z depth
+    let z_depth = (f32(n.layer) / 3.5 - 1.0) * 1.5; // Scale for visibility
+    
     let world_pos = vec3<f32>(n.pos, z_depth) * 3.0 + vertex_pos * 0.015;
     out.clip_position = camera_uni.view_proj * vec4<f32>(world_pos, 1.0);
     
     var col = vec3<f32>(0.0);
     let display_val = n.voltage;
     
-    if (n.layer == 0u) {
-        // Input layer: Red
+    // Color by depth gradient
+    let depth_norm = (z_depth + 1.5) / 3.0; // 0 to 1
+    
+    if (depth_norm < 0.15) {
+        // Bottom (input): Red
         col = vec3<f32>(display_val, 0.0, 0.0);
+    } else if (depth_norm > 0.85) {
+        // Top (prediction): Blue
+        col = vec3<f32>(0.0, 0.0, display_val);
     } else {
-        // Cortical columns: Show activation + boost level
+        // Middle (cortex): White/cyan with boost glow
         let boost_glow = (n.fatigue - 1.0) * 0.1;
-        col = vec3<f32>(display_val, display_val * 0.5 + boost_glow, display_val * 0.5 + boost_glow);
+        col = vec3<f32>(display_val * 0.5, display_val, display_val * 0.5 + boost_glow);
     }
     
     out.color = vec4<f32>(col, 1.0);

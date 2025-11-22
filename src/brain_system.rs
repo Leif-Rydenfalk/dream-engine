@@ -602,11 +602,10 @@ impl BrainSystem {
         depth_view: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
-        // --- COMPUTE PASS 1: WRITE PHASE (Write to Prediction) ---
-        // This pass calculates the new predictions from the network state
+        // --- COMPUTE PASS 1: Update neurons and populate grid ---
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Phase 1 (Write)"),
+                label: Some("Compute Phase 1"),
                 timestamp_writes: None,
             });
 
@@ -624,15 +623,12 @@ impl BrainSystem {
             cpass.set_pipeline(&self.populate_grid_pipeline);
             cpass.dispatch_workgroups((NEURON_COUNT + 63) / 64, 1, 1);
 
-            cpass.set_pipeline(&self.render_error_pipeline);
-            cpass.dispatch_workgroups(64, 64, 1);
-
-            // This writes to prediction texture from L6 neurons
+            // FIRST: Generate prediction from current state
             cpass.set_pipeline(&self.render_dream_pipeline);
             cpass.dispatch_workgroups(64, 64, 1);
         }
 
-        // If camera is off, copy the dream back to input for feedback loop
+        // Copy prediction to input if dreaming
         if self.params.use_camera == 0 {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -655,23 +651,28 @@ impl BrainSystem {
             );
         }
 
-        // --- COMPUTE PASS 2: READ PHASE (Read from Prediction) ---
-        // This pass updates neurons based on the error between Input and Prediction
+        // --- COMPUTE PASS 2: Update neurons based on prediction error ---
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Phase 2 (Read)"),
+                label: Some("Compute Phase 2"),
                 timestamp_writes: None,
             });
 
             cpass.set_bind_group(0, &self.compute_bg_read, &[]);
 
+            // Update neurons (this computes error in L0)
             cpass.set_pipeline(&self.update_neurons_pipeline);
             cpass.dispatch_workgroups((NEURON_COUNT + 63) / 64, 1, 1);
+
+            // NOW render the error visualization
+            cpass.set_pipeline(&self.render_error_pipeline);
+            cpass.dispatch_workgroups(64, 64, 1);
 
             cpass.set_pipeline(&self.generate_lines_pipeline);
             cpass.dispatch_workgroups((NEURON_COUNT + 63) / 64, 1, 1);
         }
 
+        // Render
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render"),
